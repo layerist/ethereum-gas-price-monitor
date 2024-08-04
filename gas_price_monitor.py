@@ -3,20 +3,17 @@ import time
 import signal
 import sys
 import logging
-
-# Your Etherscan API key
-API_KEY = 'YourEtherscanAPIKey'
-
-# URL for the Etherscan API to get gas price
-ETHERSCAN_API_URL = f'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={API_KEY}'
+import argparse
+import os
+from typing import Optional, Dict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Function to get the current gas prices
-def get_gas_prices():
+def get_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
+    url = f'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={api_key}'
     try:
-        response = requests.get(ETHERSCAN_API_URL)
+        response = requests.get(url)
         response.raise_for_status()  # Raise an HTTPError for bad responses (4xx and 5xx)
         data = response.json()
 
@@ -38,30 +35,39 @@ def get_gas_prices():
         logging.error(f"Value error occurred: {e}")
         return None
 
-# Function to handle the keyboard interrupt signal
 def signal_handler(sig, frame):
     logging.info("Gracefully stopping the script...")
     sys.exit(0)
 
-# Register the signal handler
-signal.signal(signal.SIGINT, signal_handler)
-
-# Main loop to get gas prices every second
-if __name__ == "__main__":
+def main(api_key: str, interval: int):
     logging.info("Starting Ethereum Gas Price Monitor (Press Ctrl+C to stop)...")
-    
-    interval = 1  # Interval in seconds between requests
-    
+
+    # Register the signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+
     try:
         while True:
-            gas_prices = get_gas_prices()
-            
+            gas_prices = get_gas_prices(api_key)
+
             if gas_prices:
                 logging.info(f"Safe Gas Price: {gas_prices['SafeGasPrice']} gwei")
                 logging.info(f"Propose Gas Price: {gas_prices['ProposeGasPrice']} gwei")
                 logging.info(f"Fast Gas Price: {gas_prices['FastGasPrice']} gwei")
-            
+
             time.sleep(interval)
     except KeyboardInterrupt:
         logging.info("Gracefully stopping the script...")
         sys.exit(0)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Ethereum Gas Price Monitor")
+    parser.add_argument("--api_key", type=str, default=os.getenv("ETHERSCAN_API_KEY"), help="Etherscan API key")
+    parser.add_argument("--interval", type=int, default=1, help="Interval in seconds between requests")
+
+    args = parser.parse_args()
+
+    if not args.api_key:
+        logging.error("API key is required. Set it via --api_key argument or ETHERSCAN_API_KEY environment variable.")
+        sys.exit(1)
+
+    main(api_key=args.api_key, interval=args.interval)
