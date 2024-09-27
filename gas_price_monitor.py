@@ -24,7 +24,7 @@ def get_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
     url = f'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={api_key}'
     
     try:
-        response = requests.get(url, timeout=10)  # Set a timeout for the request
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
 
         data = response.json()
@@ -37,35 +37,35 @@ def get_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
                 'FastGasPrice': gas_prices.get('FastGasPrice', 'N/A')
             }
         else:
-            logger.error(f"API error: {data.get('message', 'Unknown error')}")
+            logger.error(f"API returned an error: {data.get('message', 'Unknown error')}")
             return None
 
-    except requests.exceptions.Timeout:
-        logger.error("Request timed out while trying to reach the API.")
+    except requests.Timeout:
+        logger.error("The request timed out while trying to reach the API.")
         return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"HTTP Request exception: {e}")
+    except requests.RequestException as e:
+        logger.error(f"An HTTP error occurred: {e}")
         return None
     except ValueError as e:
-        logger.error(f"Error parsing JSON response: {e}")
+        logger.error(f"Failed to parse JSON response: {e}")
         return None
 
 def signal_handler(sig, frame):
-    """Handle script termination by user via Ctrl+C."""
-    logger.info("Script terminated by user.")
+    """Handle graceful shutdown on user interruption (Ctrl+C)."""
+    logger.info("Shutting down the script...")
     sys.exit(0)
 
 def main(api_key: str, interval: int):
     """
-    Main loop to fetch and log gas prices at regular intervals.
+    Main loop to fetch and log Ethereum gas prices at regular intervals.
 
     Args:
         api_key (str): Etherscan API key.
-        interval (int): Time interval between API requests, in seconds.
+        interval (int): Time interval between API requests in seconds.
     """
     logger.info("Ethereum Gas Price Monitor started. (Press Ctrl+C to stop)")
 
-    # Register the signal handler for graceful termination
+    # Handle user interruption gracefully
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
@@ -73,25 +73,24 @@ def main(api_key: str, interval: int):
             gas_prices = get_gas_prices(api_key)
 
             if gas_prices:
-                logger.info(f"Safe Gas Price: {gas_prices['SafeGasPrice']} gwei")
-                logger.info(f"Propose Gas Price: {gas_prices['ProposeGasPrice']} gwei")
-                logger.info(f"Fast Gas Price: {gas_prices['FastGasPrice']} gwei")
+                logger.info(f"Safe Gas Price: {gas_prices['SafeGasPrice']} Gwei")
+                logger.info(f"Propose Gas Price: {gas_prices['ProposeGasPrice']} Gwei")
+                logger.info(f"Fast Gas Price: {gas_prices['FastGasPrice']} Gwei")
             else:
-                logger.warning("Failed to retrieve gas prices. Retrying...")
+                logger.warning("Failed to retrieve gas prices. Will retry...")
 
-            time.sleep(interval)
+            time.sleep(max(interval, 10))
 
-    except KeyboardInterrupt:
-        logger.info("Gracefully stopping the script...")
-        sys.exit(0)
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ethereum Gas Price Monitor")
-    parser.add_argument("--api_key", type=str, default=os.getenv("ETHERSCAN_API_KEY"), help="Etherscan API key")
-    parser.add_argument("--interval", type=int, default=60, help="Interval in seconds between requests (minimum 10 seconds)")
+    parser.add_argument("--api_key", type=str, default=os.getenv("ETHERSCAN_API_KEY"), 
+                        help="Etherscan API key (can also be set as environment variable ETHERSCAN_API_KEY)")
+    parser.add_argument("--interval", type=int, default=60, 
+                        help="Time interval between API requests in seconds (must be at least 10 seconds)")
 
     args = parser.parse_args()
 
@@ -100,7 +99,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args.interval < 10:
-        logger.error("Interval must be at least 10 seconds.")
+        logger.error("The interval must be at least 10 seconds.")
         sys.exit(1)
 
     main(api_key=args.api_key, interval=args.interval)
