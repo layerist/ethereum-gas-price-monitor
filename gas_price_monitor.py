@@ -55,6 +55,22 @@ def signal_handler(sig, frame):
     logger.info("Shutting down the script gracefully...")
     sys.exit(0)
 
+def validate_interval(interval: int) -> int:
+    """
+    Ensure the interval meets a minimum threshold.
+
+    Args:
+        interval (int): Desired time interval between API requests in seconds.
+
+    Returns:
+        int: Validated interval.
+    """
+    MIN_INTERVAL = 10
+    if interval < MIN_INTERVAL:
+        logger.warning(f"Interval less than {MIN_INTERVAL} seconds is too short. Using minimum interval of {MIN_INTERVAL} seconds.")
+        return MIN_INTERVAL
+    return interval
+
 def main(api_key: str, interval: int):
     """
     Main loop to fetch and log Ethereum gas prices at regular intervals.
@@ -67,6 +83,8 @@ def main(api_key: str, interval: int):
 
     # Handle user interruption gracefully
     signal.signal(signal.SIGINT, signal_handler)
+
+    interval = validate_interval(interval)
 
     while True:
         gas_prices = get_gas_prices(api_key)
@@ -93,10 +111,5 @@ if __name__ == "__main__":
     if not args.api_key:
         logger.error("API key is required. Set it via --api_key argument or ETHERSCAN_API_KEY environment variable.")
         sys.exit(1)
-
-    # Enforce a minimum interval of 10 seconds
-    if args.interval < 10:
-        logger.warning("Interval less than 10 seconds is too short. Using the minimum interval of 10 seconds.")
-        args.interval = 10
 
     main(api_key=args.api_key, interval=args.interval)
