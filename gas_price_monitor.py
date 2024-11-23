@@ -11,7 +11,10 @@ from typing import Optional, Dict
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def get_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
+API_URL = 'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={api_key}'
+MIN_INTERVAL = 10  # Minimum allowed interval between API requests in seconds
+
+def fetch_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
     """
     Fetch current Ethereum gas prices from the Etherscan API.
 
@@ -21,34 +24,28 @@ def get_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
     Returns:
         Optional[Dict[str, str]]: Dictionary containing Safe, Propose, and Fast gas prices in Gwei, or None on failure.
     """
-    url = f'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={api_key}'
-    
+    url = API_URL.format(api_key=api_key)
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-
         data = response.json()
 
         if data.get('status') == '1':
-            gas_prices = data.get('result', {})
             return {
-                'SafeGasPrice': gas_prices.get('SafeGasPrice', 'N/A'),
-                'ProposeGasPrice': gas_prices.get('ProposeGasPrice', 'N/A'),
-                'FastGasPrice': gas_prices.get('FastGasPrice', 'N/A')
+                'SafeGasPrice': data['result'].get('SafeGasPrice', 'N/A'),
+                'ProposeGasPrice': data['result'].get('ProposeGasPrice', 'N/A'),
+                'FastGasPrice': data['result'].get('FastGasPrice', 'N/A'),
             }
         else:
             logger.error(f"API error: {data.get('message', 'Unknown error')}")
             return None
-
     except requests.Timeout:
         logger.error("The request to Etherscan API timed out.")
-        return None
     except requests.RequestException as e:
         logger.error(f"An HTTP error occurred: {e}")
-        return None
     except ValueError as e:
         logger.error(f"Failed to parse JSON response: {e}")
-        return None
+    return None
 
 def signal_handler(sig, frame):
     """Handle graceful shutdown on user interruption (Ctrl+C)."""
@@ -65,7 +62,6 @@ def validate_interval(interval: int) -> int:
     Returns:
         int: Validated interval.
     """
-    MIN_INTERVAL = 10
     if interval < MIN_INTERVAL:
         logger.warning(f"Interval less than {MIN_INTERVAL} seconds is too short. Using minimum interval of {MIN_INTERVAL} seconds.")
         return MIN_INTERVAL
@@ -87,15 +83,13 @@ def main(api_key: str, interval: int):
     interval = validate_interval(interval)
 
     while True:
-        gas_prices = get_gas_prices(api_key)
-
+        gas_prices = fetch_gas_prices(api_key)
         if gas_prices:
             logger.info(f"Safe Gas Price: {gas_prices['SafeGasPrice']} Gwei")
             logger.info(f"Propose Gas Price: {gas_prices['ProposeGasPrice']} Gwei")
             logger.info(f"Fast Gas Price: {gas_prices['FastGasPrice']} Gwei")
         else:
             logger.warning("Failed to retrieve gas prices. Retrying in the next interval...")
-
         time.sleep(interval)
 
 if __name__ == "__main__":
