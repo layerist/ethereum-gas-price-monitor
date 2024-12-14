@@ -8,7 +8,10 @@ import os
 from typing import Optional, Dict
 
 # Configure logging with a detailed format
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
 logger = logging.getLogger(__name__)
 
 API_URL = 'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={api_key}'
@@ -38,7 +41,6 @@ def fetch_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
             }
         else:
             logger.error(f"API error: {data.get('message', 'Unknown error')}")
-            return None
     except requests.Timeout:
         logger.error("The request to Etherscan API timed out.")
     except requests.RequestException as e:
@@ -63,7 +65,9 @@ def validate_interval(interval: int) -> int:
         int: Validated interval.
     """
     if interval < MIN_INTERVAL:
-        logger.warning(f"Interval less than {MIN_INTERVAL} seconds is too short. Using minimum interval of {MIN_INTERVAL} seconds.")
+        logger.warning(
+            f"Interval less than {MIN_INTERVAL} seconds is too short. Using minimum interval of {MIN_INTERVAL} seconds."
+        )
         return MIN_INTERVAL
     return interval
 
@@ -94,16 +98,26 @@ def main(api_key: str, interval: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ethereum Gas Price Monitor")
-    parser.add_argument("--api_key", type=str, default=os.getenv("ETHERSCAN_API_KEY"), 
-                        help="Etherscan API key (can also be set via environment variable ETHERSCAN_API_KEY)")
-    parser.add_argument("--interval", type=int, default=60, 
-                        help="Time interval between API requests in seconds (minimum 10 seconds)")
+    parser.add_argument(
+        "--api_key",
+        type=str,
+        default=os.getenv("ETHERSCAN_API_KEY"),
+        help="Etherscan API key (can also be set via environment variable ETHERSCAN_API_KEY)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help=f"Time interval between API requests in seconds (minimum {MIN_INTERVAL} seconds)",
+    )
 
     args = parser.parse_args()
 
     # Validate API key
     if not args.api_key:
-        logger.error("API key is required. Set it via --api_key argument or ETHERSCAN_API_KEY environment variable.")
+        logger.error(
+            "API key is required. Set it via --api_key argument or ETHERSCAN_API_KEY environment variable."
+        )
         sys.exit(1)
 
     main(api_key=args.api_key, interval=args.interval)
