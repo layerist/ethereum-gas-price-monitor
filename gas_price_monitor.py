@@ -17,10 +17,12 @@ logger = logging.getLogger(__name__)
 # Constants
 API_URL_TEMPLATE = 'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={api_key}'
 MIN_INTERVAL = 10  # Minimum interval between API requests (seconds)
+RETRY_LIMIT = 5  # Max retries on API failure
+RETRY_DELAY = 5  # Delay between retries (seconds)
 
 def fetch_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
     """
-    Fetch Ethereum gas prices from the Etherscan API.
+    Fetch Ethereum gas prices from the Etherscan API with retry logic.
 
     Args:
         api_key (str): Etherscan API key.
@@ -29,24 +31,28 @@ def fetch_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
         Optional[Dict[str, str]]: Gas prices as a dictionary or None on failure.
     """
     url = API_URL_TEMPLATE.format(api_key=api_key)
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+    retries = 0
+    while retries < RETRY_LIMIT:
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
 
-        if data.get('status') == '1':
-            return {
-                'SafeGasPrice': data['result'].get('SafeGasPrice', 'N/A'),
-                'ProposeGasPrice': data['result'].get('ProposeGasPrice', 'N/A'),
-                'FastGasPrice': data['result'].get('FastGasPrice', 'N/A'),
-            }
-        logger.error(f"API error: {data.get('message', 'Unknown error')}")
-    except requests.Timeout:
-        logger.error("Request to Etherscan API timed out.")
-    except requests.RequestException as e:
-        logger.error(f"HTTP error occurred: {e}")
-    except ValueError as e:
-        logger.error(f"JSON parse error: {e}")
+            if data.get('status') == '1':
+                return {
+                    'SafeGasPrice': data['result'].get('SafeGasPrice', 'N/A'),
+                    'ProposeGasPrice': data['result'].get('ProposeGasPrice', 'N/A'),
+                    'FastGasPrice': data['result'].get('FastGasPrice', 'N/A'),
+                }
+            logger.error(f"API error: {data.get('message', 'Unknown error')}")
+            break  # Break the loop on non-recoverable error
+        except (requests.Timeout, requests.RequestException) as e:
+            logger.error(f"Error occurred: {e}. Retrying {retries + 1}/{RETRY_LIMIT}...")
+            retries += 1
+            time.sleep(RETRY_DELAY)
+        except ValueError as e:
+            logger.error(f"JSON parse error: {e}")
+            break  # Exit loop on parsing error
     return None
 
 def signal_handler(sig, frame):
