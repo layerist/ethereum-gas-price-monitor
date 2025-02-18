@@ -10,15 +10,16 @@ from typing import Optional, Dict
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("EthereumGasMonitor")
 
 # Constants
-API_URL_TEMPLATE = 'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={api_key}'
+API_URL = "https://api.etherscan.io/api"
 MIN_INTERVAL = 10  # Minimum interval between API requests (seconds)
 RETRY_LIMIT = 5  # Max retries on API failure
 RETRY_DELAY = 5  # Delay between retries (seconds)
+TIMEOUT = 10  # Request timeout in seconds
 
 def fetch_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
     """
@@ -30,77 +31,52 @@ def fetch_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
     Returns:
         Optional[Dict[str, str]]: Gas prices as a dictionary or None on failure.
     """
-    url = API_URL_TEMPLATE.format(api_key=api_key)
-    retries = 0
-    while retries < RETRY_LIMIT:
+    params = {
+        "module": "gastracker",
+        "action": "gasoracle",
+        "apikey": api_key,
+    }
+    for attempt in range(1, RETRY_LIMIT + 1):
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(API_URL, params=params, timeout=TIMEOUT)
             response.raise_for_status()
             data = response.json()
 
-            if data.get('status') == '1':
+            if data.get("status") == "1":
                 return {
-                    'SafeGasPrice': data['result'].get('SafeGasPrice', 'N/A'),
-                    'ProposeGasPrice': data['result'].get('ProposeGasPrice', 'N/A'),
-                    'FastGasPrice': data['result'].get('FastGasPrice', 'N/A'),
+                    "SafeGasPrice": data["result"].get("SafeGasPrice", "N/A"),
+                    "ProposeGasPrice": data["result"].get("ProposeGasPrice", "N/A"),
+                    "FastGasPrice": data["result"].get("FastGasPrice", "N/A"),
                 }
             logger.error(f"API error: {data.get('message', 'Unknown error')}")
-            break  # Break the loop on non-recoverable error
-        except (requests.Timeout, requests.RequestException) as e:
-            logger.error(f"Error occurred: {e}. Retrying {retries + 1}/{RETRY_LIMIT}...")
-            retries += 1
+            return None
+        except (requests.RequestException, ValueError) as e:
+            logger.error(f"Error occurred: {e}. Retrying {attempt}/{RETRY_LIMIT}...")
             time.sleep(RETRY_DELAY)
-        except ValueError as e:
-            logger.error(f"JSON parse error: {e}")
-            break  # Exit loop on parsing error
     return None
 
 def signal_handler(sig, frame):
-    """
-    Handle script termination gracefully.
-
-    Args:
-        sig: Signal number.
-        frame: Current stack frame.
-    """
+    """Handle script termination gracefully."""
     logger.info("Shutting down gracefully...")
     sys.exit(0)
 
 def validate_interval(interval: int) -> int:
-    """
-    Ensure the interval is above the minimum threshold.
-
-    Args:
-        interval (int): Desired interval in seconds.
-
-    Returns:
-        int: Validated interval.
-    """
+    """Ensure the interval is above the minimum threshold."""
     if interval < MIN_INTERVAL:
-        logger.warning(
-            f"Interval too short. Using minimum of {MIN_INTERVAL} seconds."
-        )
+        logger.warning(f"Interval too short. Using minimum of {MIN_INTERVAL} seconds.")
         return MIN_INTERVAL
     return interval
 
 def log_gas_prices(gas_prices: Dict[str, str]):
-    """
-    Log gas prices at the INFO level.
-
-    Args:
-        gas_prices (Dict[str, str]): Dictionary containing gas prices.
-    """
-    logger.info(f"Safe Gas Price: {gas_prices['SafeGasPrice']} Gwei")
-    logger.info(f"Propose Gas Price: {gas_prices['ProposeGasPrice']} Gwei")
-    logger.info(f"Fast Gas Price: {gas_prices['FastGasPrice']} Gwei")
+    """Log gas prices at the INFO level."""
+    logger.info(
+        f"Gas Prices (Gwei) -> Safe: {gas_prices['SafeGasPrice']}, "
+        f"Propose: {gas_prices['ProposeGasPrice']}, Fast: {gas_prices['FastGasPrice']}"
+    )
 
 def main(api_key: str, interval: int):
     """
     Main loop to fetch and log Ethereum gas prices periodically.
-
-    Args:
-        api_key (str): Etherscan API key.
-        interval (int): Interval between API requests in seconds.
     """
     logger.info("Starting Ethereum Gas Price Monitor... (Press Ctrl+C to stop)")
     signal.signal(signal.SIGINT, signal_handler)
@@ -120,6 +96,7 @@ if __name__ == "__main__":
         "--api_key",
         type=str,
         default=os.getenv("ETHERSCAN_API_KEY"),
+        required=True,
         help="Etherscan API key (or set via ETHERSCAN_API_KEY environment variable)",
     )
     parser.add_argument(
@@ -129,9 +106,5 @@ if __name__ == "__main__":
         help=f"Time interval between requests (minimum {MIN_INTERVAL} seconds).",
     )
     args = parser.parse_args()
-
-    if not args.api_key:
-        logger.error("API key is required. Provide it via --api_key or the ETHERSCAN_API_KEY environment variable.")
-        sys.exit(1)
 
     main(api_key=args.api_key, interval=args.interval)
