@@ -36,23 +36,25 @@ def fetch_gas_prices(api_key: str) -> Optional[Dict[str, str]]:
         "action": "gasoracle",
         "apikey": api_key,
     }
-    for attempt in range(1, RETRY_LIMIT + 1):
+    
+    for attempt in range(RETRY_LIMIT):
         try:
             response = requests.get(API_URL, params=params, timeout=TIMEOUT)
             response.raise_for_status()
             data = response.json()
-
-            if data.get("status") == "1":
+            
+            if data.get("status") == "1" and "result" in data:
                 return {
-                    "SafeGasPrice": data["result"].get("SafeGasPrice", "N/A"),
-                    "ProposeGasPrice": data["result"].get("ProposeGasPrice", "N/A"),
-                    "FastGasPrice": data["result"].get("FastGasPrice", "N/A"),
+                    key: data["result"].get(key, "N/A")
+                    for key in ("SafeGasPrice", "ProposeGasPrice", "FastGasPrice")
                 }
+            
             logger.error(f"API error: {data.get('message', 'Unknown error')}")
-            return None
-        except (requests.RequestException, ValueError) as e:
-            logger.error(f"Error occurred: {e}. Retrying {attempt}/{RETRY_LIMIT}...")
+            break
+        except requests.RequestException as e:
+            logger.error(f"Request failed: {e} (Attempt {attempt + 1}/{RETRY_LIMIT})")
             time.sleep(RETRY_DELAY)
+    
     return None
 
 def signal_handler(sig, frame):
@@ -62,16 +64,13 @@ def signal_handler(sig, frame):
 
 def validate_interval(interval: int) -> int:
     """Ensure the interval is above the minimum threshold."""
-    if interval < MIN_INTERVAL:
-        logger.warning(f"Interval too short. Using minimum of {MIN_INTERVAL} seconds.")
-        return MIN_INTERVAL
-    return interval
+    return max(interval, MIN_INTERVAL)
 
 def log_gas_prices(gas_prices: Dict[str, str]):
     """Log gas prices at the INFO level."""
     logger.info(
-        f"Gas Prices (Gwei) -> Safe: {gas_prices['SafeGasPrice']}, "
-        f"Propose: {gas_prices['ProposeGasPrice']}, Fast: {gas_prices['FastGasPrice']}"
+        "Gas Prices (Gwei) -> Safe: %(SafeGasPrice)s, Propose: %(ProposeGasPrice)s, Fast: %(FastGasPrice)s",
+        gas_prices
     )
 
 def main(api_key: str, interval: int):
@@ -81,7 +80,7 @@ def main(api_key: str, interval: int):
     logger.info("Starting Ethereum Gas Price Monitor... (Press Ctrl+C to stop)")
     signal.signal(signal.SIGINT, signal_handler)
     interval = validate_interval(interval)
-
+    
     while True:
         gas_prices = fetch_gas_prices(api_key)
         if gas_prices:
@@ -96,7 +95,7 @@ if __name__ == "__main__":
         "--api_key",
         type=str,
         default=os.getenv("ETHERSCAN_API_KEY"),
-        required=True,
+        required=not os.getenv("ETHERSCAN_API_KEY"),
         help="Etherscan API key (or set via ETHERSCAN_API_KEY environment variable)",
     )
     parser.add_argument(
@@ -106,5 +105,5 @@ if __name__ == "__main__":
         help=f"Time interval between requests (minimum {MIN_INTERVAL} seconds).",
     )
     args = parser.parse_args()
-
+    
     main(api_key=args.api_key, interval=args.interval)
