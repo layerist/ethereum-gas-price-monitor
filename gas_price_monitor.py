@@ -8,11 +8,13 @@ import os
 from typing import Optional, TypedDict, Dict
 
 # === Configuration ===
-API_URL = "https://api.etherscan.io/api"
-MIN_INTERVAL = 10
-RETRY_LIMIT = 5
-INITIAL_RETRY_DELAY = 5
-TIMEOUT = 10
+class Config:
+    API_URL = "https://api.etherscan.io/api"
+    MIN_INTERVAL = 10
+    RETRY_LIMIT = 5
+    INITIAL_RETRY_DELAY = 5
+    TIMEOUT = 10
+
 
 # === Typed Result ===
 class GasPrices(TypedDict):
@@ -20,32 +22,32 @@ class GasPrices(TypedDict):
     ProposeGasPrice: str
     FastGasPrice: str
 
+
 # === Logging ===
 logger = logging.getLogger("EthereumGasMonitor")
 
 
 def setup_logging(level: str = "INFO") -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
+# === Gas Price Fetching ===
 def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
-    """
-    Fetch Ethereum gas prices from the Etherscan API with retry logic.
-    """
     params = {
         "module": "gastracker",
         "action": "gasoracle",
         "apikey": api_key,
     }
 
-    delay = INITIAL_RETRY_DELAY
+    delay = Config.INITIAL_RETRY_DELAY
 
-    for attempt in range(1, RETRY_LIMIT + 1):
+    for attempt in range(1, Config.RETRY_LIMIT + 1):
         try:
-            response = requests.get(API_URL, params=params, timeout=TIMEOUT)
+            response = requests.get(Config.API_URL, params=params, timeout=Config.TIMEOUT)
             response.raise_for_status()
             data = response.json()
 
@@ -58,40 +60,40 @@ def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
                 }
 
             logger.error(f"Etherscan API error: {data.get('message', 'Unknown error')}")
-            break  # No need to retry if API returns failure status
+            return None  # Stop retrying if API returns valid response with error
 
         except requests.RequestException as e:
-            logger.warning(f"Request failed: {e} (Attempt {attempt}/{RETRY_LIMIT})")
-            if attempt < RETRY_LIMIT:
-                logger.info(f"Retrying in {delay} seconds...")
+            logger.warning(f"Request failed: {e} (Attempt {attempt}/{Config.RETRY_LIMIT})")
+            if attempt < Config.RETRY_LIMIT:
+                logger.debug(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
                 delay *= 2
             else:
-                logger.error("Maximum retry attempts reached. Aborting.")
+                logger.error("Maximum retry attempts reached.")
+                return None
 
     return None
 
 
+# === Logging Output ===
 def log_gas_prices(prices: GasPrices) -> None:
-    """Log formatted gas prices."""
     logger.info(
-        "Gas Prices (Gwei) → Safe: %s | Propose: %s | Fast: %s",
-        prices["SafeGasPrice"],
-        prices["ProposeGasPrice"],
-        prices["FastGasPrice"]
+        f"Gas Prices (Gwei) → Safe: {prices['SafeGasPrice']} | "
+        f"Propose: {prices['ProposeGasPrice']} | Fast: {prices['FastGasPrice']}"
     )
 
 
+# === Signal Handling ===
 def signal_handler(sig, frame) -> None:
-    """Handle termination signals gracefully."""
     logger.info("Received termination signal. Exiting.")
     sys.exit(0)
 
 
+# === Main Logic ===
 def validate_interval(value: int) -> int:
-    if value < MIN_INTERVAL:
-        logger.warning(f"Interval too short; using minimum of {MIN_INTERVAL} seconds.")
-    return max(value, MIN_INTERVAL)
+    if value < Config.MIN_INTERVAL:
+        logger.warning(f"Interval too short; using minimum of {Config.MIN_INTERVAL} seconds.")
+    return max(value, Config.MIN_INTERVAL)
 
 
 def main(api_key: str, interval: int) -> None:
@@ -108,13 +110,13 @@ def main(api_key: str, interval: int) -> None:
         if gas_prices:
             log_gas_prices(gas_prices)
         else:
-            logger.warning("Could not retrieve gas prices.")
+            logger.warning("Failed to retrieve gas prices.")
 
         elapsed = time.monotonic() - start_time
-        sleep_time = max(0, interval - elapsed)
-        time.sleep(sleep_time)
+        time.sleep(max(0, interval - elapsed))
 
 
+# === Entry Point ===
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ethereum Gas Price Monitor")
     parser.add_argument(
@@ -128,7 +130,7 @@ if __name__ == "__main__":
         "--interval",
         type=int,
         default=60,
-        help=f"Polling interval in seconds (minimum {MIN_INTERVAL}).",
+        help=f"Polling interval in seconds (minimum {Config.MIN_INTERVAL}).",
     )
     parser.add_argument(
         "--log_level",
