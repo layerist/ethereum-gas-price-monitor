@@ -5,7 +5,7 @@ import sys
 import logging
 import argparse
 import os
-from typing import Optional, TypedDict, Dict
+from typing import Optional, TypedDict
 
 # === Configuration ===
 class Config:
@@ -28,8 +28,11 @@ logger = logging.getLogger("EthereumGasMonitor")
 
 
 def setup_logging(level: str = "INFO") -> None:
+    if logger.handlers:
+        return  # prevent duplicate handlers
+
     handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter("\033[92m%(asctime)s\033[0m - \033[94m%(levelname)s\033[0m - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -60,7 +63,7 @@ def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
                 }
 
             logger.error(f"Etherscan API error: {data.get('message', 'Unknown error')}")
-            return None  # Stop retrying if API returns valid response with error
+            return None  # No retry for logical errors
 
         except requests.RequestException as e:
             logger.warning(f"Request failed: {e} (Attempt {attempt}/{Config.RETRY_LIMIT})")
@@ -78,14 +81,14 @@ def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
 # === Logging Output ===
 def log_gas_prices(prices: GasPrices) -> None:
     logger.info(
-        f"Gas Prices (Gwei) → Safe: {prices['SafeGasPrice']} | "
-        f"Propose: {prices['ProposeGasPrice']} | Fast: {prices['FastGasPrice']}"
+        f"\033[93mGas Prices (Gwei):\033[0m Safe={prices['SafeGasPrice']} | "
+        f"Propose={prices['ProposeGasPrice']} | Fast={prices['FastGasPrice']}"
     )
 
 
 # === Signal Handling ===
 def signal_handler(sig, frame) -> None:
-    logger.info("Received termination signal. Exiting.")
+    logger.info("Termination signal received. Exiting gracefully.")
     sys.exit(0)
 
 
@@ -96,49 +99,64 @@ def validate_interval(value: int) -> int:
     return max(value, Config.MIN_INTERVAL)
 
 
-def main(api_key: str, interval: int) -> None:
-    logger.info("Starting Ethereum Gas Price Monitor (Press Ctrl+C to stop)")
+def run_monitor(api_key: str, interval: int, run_once: bool = False) -> None:
+    logger.info("Ethereum Gas Price Monitor started (Press Ctrl+C to stop)")
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     interval = validate_interval(interval)
 
-    while True:
-        start_time = time.monotonic()
-        gas_prices = fetch_gas_prices(api_key)
+    try:
+        while True:
+            start_time = time.monotonic()
+            prices = fetch_gas_prices(api_key)
 
-        if gas_prices:
-            log_gas_prices(gas_prices)
-        else:
-            logger.warning("Failed to retrieve gas prices.")
+            if prices:
+                log_gas_prices(prices)
+            else:
+                logger.warning("Failed to retrieve gas prices.")
 
-        elapsed = time.monotonic() - start_time
-        time.sleep(max(0, interval - elapsed))
+            if run_once:
+                break
+
+            elapsed = time.monotonic() - start_time
+            time.sleep(max(0, interval - elapsed))
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user. Shutting down.")
 
 
 # === Entry Point ===
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Ethereum Gas Price Monitor")
     parser.add_argument(
         "--api_key",
         type=str,
         default=os.getenv("ETHERSCAN_API_KEY"),
         required=not bool(os.getenv("ETHERSCAN_API_KEY")),
-        help="Etherscan API key (or set ETHERSCAN_API_KEY environment variable).",
+        help="Etherscan API key (or set ETHERSCAN_API_KEY env variable)."
     )
     parser.add_argument(
         "--interval",
         type=int,
         default=60,
-        help=f"Polling interval in seconds (minimum {Config.MIN_INTERVAL}).",
+        help=f"Polling interval in seconds (minimum {Config.MIN_INTERVAL})."
     )
     parser.add_argument(
         "--log_level",
         type=str,
         default="INFO",
-        help="Logging level (DEBUG, INFO, WARNING, ERROR). Default is INFO.",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR). Default is INFO."
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run once and exit (non-daemon mode)."
     )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
-    main(api_key=args.api_key, interval=args.interval)
+    run_monitor(api_key=args.api_key, interval=args.interval, run_once=args.once)
+
+
+if __name__ == "__main__":
+    main()
