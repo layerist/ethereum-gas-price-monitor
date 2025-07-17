@@ -1,11 +1,14 @@
-import requests
-import time
+import argparse
+import logging
+import os
 import signal
 import sys
-import logging
-import argparse
-import os
-from typing import Optional, TypedDict
+import time
+from random import uniform
+from typing import Literal, Optional, TypedDict
+
+import requests
+
 
 # === Configuration ===
 class Config:
@@ -28,17 +31,24 @@ logger = logging.getLogger("EthereumGasMonitor")
 
 
 def setup_logging(level: str = "INFO") -> None:
-    if logger.handlers:
-        return  # prevent duplicate handlers
+    if logger.hasHandlers():
+        return
 
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("\033[92m%(asctime)s\033[0m - \033[94m%(levelname)s\033[0m - %(message)s")
+    try:
+        from rich.logging import RichHandler
+        handler = RichHandler(rich_tracebacks=True)
+    except ImportError:
+        handler = logging.StreamHandler()
+
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"
+    )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
-# === Gas Price Fetching ===
+# === Fetch Gas Prices ===
 def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
     params = {
         "module": "gastracker",
@@ -62,53 +72,57 @@ def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
                     "FastGasPrice": result.get("FastGasPrice", "N/A"),
                 }
 
-            logger.error(f"Etherscan API error: {data.get('message', 'Unknown error')}")
-            return None  # No retry for logical errors
+            logger.error(f"API responded with error: {data.get('message', 'Unknown')} — {data}")
+            return None
 
         except requests.RequestException as e:
-            logger.warning(f"Request failed: {e} (Attempt {attempt}/{Config.RETRY_LIMIT})")
+            logger.warning(f"[Attempt {attempt}/{Config.RETRY_LIMIT}] Request failed: {e}")
             if attempt < Config.RETRY_LIMIT:
-                logger.debug(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
+                jitter = uniform(0.5, 1.5)
+                sleep_time = delay * jitter
+                logger.debug(f"Retrying in {sleep_time:.1f} seconds...")
+                time.sleep(sleep_time)
                 delay *= 2
             else:
-                logger.error("Maximum retry attempts reached.")
+                logger.error("All retry attempts failed.")
                 return None
 
     return None
 
 
-# === Logging Output ===
+# === Log Prices ===
 def log_gas_prices(prices: GasPrices) -> None:
     logger.info(
-        f"\033[93mGas Prices (Gwei):\033[0m Safe={prices['SafeGasPrice']} | "
-        f"Propose={prices['ProposeGasPrice']} | Fast={prices['FastGasPrice']}"
+        f"⛽ Gas Prices (Gwei): Safe = {prices['SafeGasPrice']} | "
+        f"Propose = {prices['ProposeGasPrice']} | Fast = {prices['FastGasPrice']}"
     )
 
 
 # === Signal Handling ===
-def signal_handler(sig, frame) -> None:
+def signal_handler(sig, frame):
     logger.info("Termination signal received. Exiting gracefully.")
     sys.exit(0)
 
 
-# === Main Logic ===
+# === Validate interval ===
 def validate_interval(value: int) -> int:
     if value < Config.MIN_INTERVAL:
-        logger.warning(f"Interval too short; using minimum of {Config.MIN_INTERVAL} seconds.")
+        logger.warning(f"Interval too short, using minimum: {Config.MIN_INTERVAL}s")
     return max(value, Config.MIN_INTERVAL)
 
 
+# === Monitor Logic ===
 def run_monitor(api_key: str, interval: int, run_once: bool = False) -> None:
-    logger.info("Ethereum Gas Price Monitor started (Press Ctrl+C to stop)")
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
+    logger.info("📡 Ethereum Gas Price Monitor started")
     interval = validate_interval(interval)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         while True:
-            start_time = time.monotonic()
+            start = time.monotonic()
             prices = fetch_gas_prices(api_key)
 
             if prices:
@@ -119,7 +133,7 @@ def run_monitor(api_key: str, interval: int, run_once: bool = False) -> None:
             if run_once:
                 break
 
-            elapsed = time.monotonic() - start_time
+            elapsed = time.monotonic() - start
             time.sleep(max(0, interval - elapsed))
     except KeyboardInterrupt:
         logger.info("Interrupted by user. Shutting down.")
@@ -133,28 +147,34 @@ def main():
         type=str,
         default=os.getenv("ETHERSCAN_API_KEY"),
         required=not bool(os.getenv("ETHERSCAN_API_KEY")),
-        help="Etherscan API key (or set ETHERSCAN_API_KEY env variable)."
+        help="Etherscan API key or set ENV ETHERSCAN_API_KEY"
     )
     parser.add_argument(
         "--interval",
         type=int,
         default=60,
-        help=f"Polling interval in seconds (minimum {Config.MIN_INTERVAL})."
+        help=f"Polling interval in seconds (min {Config.MIN_INTERVAL})"
     )
     parser.add_argument(
         "--log_level",
         type=str,
         default="INFO",
-        help="Logging level (DEBUG, INFO, WARNING, ERROR). Default is INFO."
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO)"
     )
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Run once and exit (non-daemon mode)."
+        help="Run once and exit"
     )
+
     args = parser.parse_args()
 
     setup_logging(args.log_level)
+    if not args.api_key:
+        logger.critical("Missing API key. Use --api_key or set ETHERSCAN_API_KEY.")
+        sys.exit(1)
+
     run_monitor(api_key=args.api_key, interval=args.interval, run_once=args.once)
 
 
