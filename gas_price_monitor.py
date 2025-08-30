@@ -5,20 +5,22 @@ import signal
 import sys
 import time
 from random import uniform
-from typing import Optional, TypedDict
+from typing import Optional, TypedDict, Dict
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # === Configuration ===
 class Config:
-    API_URL = "https://api.etherscan.io/api"
-    MIN_INTERVAL = 10  # seconds
-    RETRY_LIMIT = 5
-    INITIAL_RETRY_DELAY = 5  # seconds
-    TIMEOUT = 10  # seconds
-    LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
-    LOG_DATE_FORMAT = "%H:%M:%S"
+    API_URL: str = "https://api.etherscan.io/api"
+    MIN_INTERVAL: int = 10  # seconds
+    RETRY_LIMIT: int = 5
+    INITIAL_RETRY_DELAY: int = 5  # seconds
+    TIMEOUT: int = 10  # seconds
+    LOG_FORMAT: str = "%(asctime)s - %(levelname)s - %(message)s"
+    LOG_DATE_FORMAT: str = "%H:%M:%S"
 
 
 # === Typed Result ===
@@ -35,11 +37,11 @@ logger = logging.getLogger("EthereumGasMonitor")
 def setup_logging(level: str = "INFO") -> None:
     """Set up logging with RichHandler if available, fallback to standard logging."""
     if logger.hasHandlers():
-        return  # Prevent duplicate handlers
+        return
 
     try:
         from rich.logging import RichHandler
-        handler = RichHandler(rich_tracebacks=True, show_time=True)
+        handler = RichHandler(rich_tracebacks=True, show_time=True, show_path=False)
     except ImportError:
         handler = logging.StreamHandler()
 
@@ -49,10 +51,29 @@ def setup_logging(level: str = "INFO") -> None:
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
+# === Requests Session ===
+def create_session() -> requests.Session:
+    """Create a requests session with retry adapter."""
+    session = requests.Session()
+    retries = Retry(
+        total=Config.RETRY_LIMIT,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+session = create_session()
+
+
 # === Fetch Gas Prices ===
 def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
-    """Fetch current Ethereum gas prices from Etherscan API with retries."""
-    params = {
+    """Fetch current Ethereum gas prices from Etherscan API with retries + jitter."""
+    params: Dict[str, str] = {
         "module": "gastracker",
         "action": "gasoracle",
         "apikey": api_key,
@@ -62,8 +83,8 @@ def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
 
     for attempt in range(1, Config.RETRY_LIMIT + 1):
         try:
-            logger.debug(f"Fetching gas prices (Attempt {attempt})...")
-            response = requests.get(Config.API_URL, params=params, timeout=Config.TIMEOUT)
+            logger.debug(f"Fetching gas prices (attempt {attempt})...")
+            response = session.get(Config.API_URL, params=params, timeout=Config.TIMEOUT)
             response.raise_for_status()
 
             data = response.json()
@@ -81,11 +102,11 @@ def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
         except requests.RequestException as e:
             logger.warning(f"Request failed: {e} [Attempt {attempt}/{Config.RETRY_LIMIT}]")
             if attempt < Config.RETRY_LIMIT:
-                jitter = uniform(0.5, 1.5)
+                jitter = uniform(0.8, 1.2)
                 sleep_time = delay * jitter
                 logger.debug(f"Retrying in {sleep_time:.1f}s...")
                 time.sleep(sleep_time)
-                delay *= 2  # exponential backoff
+                delay *= 2
             else:
                 logger.error("All retry attempts failed.")
                 return None
@@ -95,16 +116,28 @@ def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
 # === Log Prices ===
 def log_gas_prices(prices: GasPrices) -> None:
     """Log gas prices in a human-friendly format."""
-    logger.info(
-        f"⛽ Gas Prices (Gwei): "
-        f"Safe = {prices['SafeGasPrice']} | "
-        f"Propose = {prices['ProposeGasPrice']} | "
-        f"Fast = {prices['FastGasPrice']}"
-    )
+    try:
+        from rich.table import Table
+        from rich.console import Console
+
+        table = Table(title="⛽ Ethereum Gas Prices (Gwei)")
+        table.add_column("Safe", justify="center")
+        table.add_column("Propose", justify="center")
+        table.add_column("Fast", justify="center")
+        table.add_row(prices["SafeGasPrice"], prices["ProposeGasPrice"], prices["FastGasPrice"])
+        Console().print(table)
+
+    except ImportError:
+        logger.info(
+            f"⛽ Gas Prices (Gwei): "
+            f"Safe={prices['SafeGasPrice']} | "
+            f"Propose={prices['ProposeGasPrice']} | "
+            f"Fast={prices['FastGasPrice']}"
+        )
 
 
 # === Signal Handling ===
-def signal_handler(sig, frame):
+def signal_handler(sig, frame) -> None:
     """Handle termination signals for graceful shutdown."""
     logger.info("Termination signal received. Exiting gracefully.")
     sys.exit(0)
@@ -150,7 +183,7 @@ def run_monitor(api_key: str, interval: int, run_once: bool = False) -> None:
 
 
 # === Entry Point ===
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Ethereum Gas Price Monitor")
     parser.add_argument(
         "--api_key",
@@ -162,13 +195,13 @@ def main():
     parser.add_argument(
         "--interval",
         type=int,
-        default=60,
+        default=int(os.getenv("ETH_GAS_INTERVAL", "60")),
         help=f"Polling interval in seconds (min {Config.MIN_INTERVAL})"
     )
     parser.add_argument(
         "--log_level",
         type=str,
-        default="INFO",
+        default=os.getenv("ETH_GAS_LOG", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Set logging level (default: INFO)"
     )
@@ -179,7 +212,6 @@ def main():
     )
 
     args = parser.parse_args()
-
     setup_logging(args.log_level)
 
     if not args.api_key:
