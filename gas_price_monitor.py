@@ -1,11 +1,12 @@
 import argparse
+import atexit
 import logging
 import os
 import signal
 import sys
 import time
 from random import uniform
-from typing import Optional, TypedDict, Dict
+from typing import Optional, TypedDict, Dict, Final, Literal
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,17 +15,17 @@ from urllib3.util.retry import Retry
 
 # === Configuration ===
 class Config:
-    API_URL: str = "https://api.etherscan.io/api"
-    MIN_INTERVAL: int = 10  # seconds
-    RETRY_LIMIT: int = 5
-    INITIAL_RETRY_DELAY: int = 5  # seconds
-    TIMEOUT: int = 10  # seconds
-    LOG_FORMAT: str = "%(asctime)s - %(levelname)s - %(message)s"
-    LOG_DATE_FORMAT: str = "%H:%M:%S"
+    API_URL: Final[str] = "https://api.etherscan.io/api"
+    MIN_INTERVAL: Final[int] = 10  # seconds
+    RETRY_LIMIT: Final[int] = 5
+    INITIAL_RETRY_DELAY: Final[int] = 5  # seconds
+    TIMEOUT: Final[int] = 10  # seconds
+    LOG_FORMAT: Final[str] = "%(asctime)s - %(levelname)s - %(message)s"
+    LOG_DATE_FORMAT: Final[str] = "%H:%M:%S"
 
 
 # === Typed Result ===
-class GasPrices(TypedDict):
+class GasPrices(TypedDict, total=False):
     SafeGasPrice: str
     ProposeGasPrice: str
     FastGasPrice: str
@@ -41,12 +42,17 @@ def setup_logging(level: str = "INFO") -> None:
 
     try:
         from rich.logging import RichHandler
-        handler = RichHandler(rich_tracebacks=True, show_time=True, show_path=False)
+        handler = RichHandler(
+            rich_tracebacks=True,
+            show_time=True,
+            show_path=False,
+            markup=True,
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))  # Rich handles formatting
     except ImportError:
         handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(Config.LOG_FORMAT, datefmt=Config.LOG_DATE_FORMAT))
 
-    formatter = logging.Formatter(Config.LOG_FORMAT, datefmt=Config.LOG_DATE_FORMAT)
-    handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
@@ -58,16 +64,28 @@ def create_session() -> requests.Session:
     retries = Retry(
         total=Config.RETRY_LIMIT,
         backoff_factor=1,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET"],
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("GET",),
     )
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
+    atexit.register(session.close)
     return session
 
 
-session = create_session()
+session: Final[requests.Session] = create_session()
+
+
+# === Retry helper ===
+def sleep_with_jitter(base_delay: int) -> int:
+    """Sleep with jitter and return the next delay (exponential backoff)."""
+    jitter = uniform(0.8, 1.2)
+    sleep_time = base_delay * jitter
+    logger.debug(f"Retrying in {sleep_time:.1f}s...")
+    time.sleep(sleep_time)
+    return base_delay * 2
 
 
 # === Fetch Gas Prices ===
@@ -102,14 +120,9 @@ def fetch_gas_prices(api_key: str) -> Optional[GasPrices]:
         except requests.RequestException as e:
             logger.warning(f"Request failed: {e} [Attempt {attempt}/{Config.RETRY_LIMIT}]")
             if attempt < Config.RETRY_LIMIT:
-                jitter = uniform(0.8, 1.2)
-                sleep_time = delay * jitter
-                logger.debug(f"Retrying in {sleep_time:.1f}s...")
-                time.sleep(sleep_time)
-                delay *= 2
+                delay = sleep_with_jitter(delay)
             else:
                 logger.error("All retry attempts failed.")
-                return None
     return None
 
 
@@ -124,15 +137,19 @@ def log_gas_prices(prices: GasPrices) -> None:
         table.add_column("Safe", justify="center")
         table.add_column("Propose", justify="center")
         table.add_column("Fast", justify="center")
-        table.add_row(prices["SafeGasPrice"], prices["ProposeGasPrice"], prices["FastGasPrice"])
+        table.add_row(
+            prices.get("SafeGasPrice", "N/A"),
+            prices.get("ProposeGasPrice", "N/A"),
+            prices.get("FastGasPrice", "N/A"),
+        )
         Console().print(table)
 
     except ImportError:
         logger.info(
             f"⛽ Gas Prices (Gwei): "
-            f"Safe={prices['SafeGasPrice']} | "
-            f"Propose={prices['ProposeGasPrice']} | "
-            f"Fast={prices['FastGasPrice']}"
+            f"Safe={prices.get('SafeGasPrice','N/A')} | "
+            f"Propose={prices.get('ProposeGasPrice','N/A')} | "
+            f"Fast={prices.get('FastGasPrice','N/A')}"
         )
 
 
