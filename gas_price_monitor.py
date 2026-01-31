@@ -2,13 +2,13 @@
 """
 Ethereum Gas Price Monitor (Etherscan)
 
-Improvements:
-- Clearer separation of concerns
-- Stronger typing & validation
-- Better error classification
-- Cleaner retry strategy (no double-retry on HTTP layer)
-- Safer shutdown handling
-- Minor performance & readability tweaks
+Highlights:
+- Clear separation of concerns
+- Strong typing & validation
+- Explicit error classes
+- Clean retry strategy (network only)
+- Graceful shutdown handling
+- Drift-corrected scheduling
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Final, Optional, TypedDict
+from threading import Event
+from typing import Final, TypedDict
 
 import requests
 from tenacity import (
@@ -65,6 +66,18 @@ class GasPrices(TypedDict):
 
 
 # ============================================================
+# Exceptions
+# ============================================================
+
+class EtherscanError(RuntimeError):
+    """Logical API error returned by Etherscan."""
+
+
+class InvalidPayloadError(ValueError):
+    """Malformed or unexpected API payload."""
+
+
+# ============================================================
 # Logging
 # ============================================================
 
@@ -82,7 +95,8 @@ def setup_logging(level: str) -> None:
     except ImportError:
         handler = logging.StreamHandler()
         formatter = logging.Formatter(
-            Config.LOG_FORMAT, datefmt=Config.LOG_DATE_FORMAT
+            Config.LOG_FORMAT,
+            datefmt=Config.LOG_DATE_FORMAT,
         )
 
     handler.setFormatter(formatter)
@@ -99,7 +113,7 @@ def create_session() -> requests.Session:
     session.headers.update(
         {
             "Accept": "application/json",
-            "User-Agent": "eth-gas-monitor/1.0",
+            "User-Agent": "eth-gas-monitor/1.1",
         }
     )
     atexit.register(session.close)
@@ -132,18 +146,22 @@ def fetch_gas_prices(api_key: str) -> GasPrices:
     )
     response.raise_for_status()
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise InvalidPayloadError("Invalid JSON from Etherscan") from exc
+
     if not isinstance(payload, dict):
-        raise ValueError(f"Invalid response structure: {payload!r}")
+        raise InvalidPayloadError(f"Unexpected payload type: {type(payload)}")
 
     if payload.get("status") != ApiStatus.OK:
-        raise RuntimeError(
-            f"Etherscan error: {payload.get('message')} | {payload.get('result')}"
+        raise EtherscanError(
+            f"{payload.get('message')} | {payload.get('result')}"
         )
 
     result = payload.get("result")
     if not isinstance(result, dict):
-        raise ValueError(f"Malformed result field: {result!r}")
+        raise InvalidPayloadError("Missing or malformed result field")
 
     try:
         return GasPrices(
@@ -152,7 +170,9 @@ def fetch_gas_prices(api_key: str) -> GasPrices:
             fast=int(result["FastGasPrice"]),
         )
     except (KeyError, ValueError, TypeError) as exc:
-        raise ValueError(f"Invalid gas price payload: {result!r}") from exc
+        raise InvalidPayloadError(
+            f"Invalid gas price values: {result!r}"
+        ) from exc
 
 
 # ============================================================
@@ -192,13 +212,12 @@ def display_gas_prices(prices: GasPrices, as_json: bool) -> None:
 # Runtime Control
 # ============================================================
 
-_stop_requested = False
+stop_event = Event()
 
 
 def handle_exit_signal(signum, _frame) -> None:
-    global _stop_requested
     logger.info("Received signal %s, shutting down…", signum)
-    _stop_requested = True
+    stop_event.set()
 
 
 def normalize_interval(interval: int) -> int:
@@ -230,20 +249,24 @@ def run_monitor(
         except Exception:
             pass
 
-    while not _stop_requested:
+    while not stop_event.is_set():
         start_ts = time.monotonic()
 
         try:
             prices = fetch_gas_prices(api_key)
             display_gas_prices(prices, as_json)
+        except EtherscanError as exc:
+            logger.error("API error: %s", exc)
+        except requests.RequestException as exc:
+            logger.error("Network error: %s", exc)
         except Exception as exc:
-            logger.error("Fetch failed: %s", exc)
+            logger.exception("Unexpected failure: %s", exc)
 
         if run_once:
             break
 
         elapsed = time.monotonic() - start_ts
-        time.sleep(max(0.0, interval - elapsed))
+        stop_event.wait(max(0.0, interval - elapsed))
 
 
 # ============================================================
@@ -251,10 +274,19 @@ def run_monitor(
 # ============================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ethereum Gas Price Monitor")
+    parser = argparse.ArgumentParser(
+        description="Ethereum Gas Price Monitor (Etherscan)"
+    )
     parser.add_argument("--api-key", default=os.getenv("ETHERSCAN_API_KEY"))
-    parser.add_argument("--interval", type=int, default=int(os.getenv("ETH_GAS_INTERVAL", "60")))
-    parser.add_argument("--log-level", default=os.getenv("ETH_GAS_LOG", "INFO"))
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=int(os.getenv("ETH_GAS_INTERVAL", "60")),
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("ETH_GAS_LOG", "INFO"),
+    )
     parser.add_argument("--once", action="store_true", help="Run once and exit")
     parser.add_argument("--json", action="store_true", help="Output JSON")
 
