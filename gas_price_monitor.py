@@ -2,13 +2,13 @@
 """
 Ethereum Gas Price Monitor (Etherscan)
 
-Highlights:
-- Clear separation of concerns
-- Strong typing & validation
-- Explicit error classes
-- Clean retry strategy (network only)
-- Graceful shutdown handling
-- Drift-corrected scheduling
+Improvements:
+- True drift-free aligned scheduler
+- Strict payload validation
+- Explicit retry boundary (network-only)
+- Deterministic shutdown handling
+- Safer parsing & logging normalization
+- Cleaner control flow & exit codes
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from threading import Event
-from typing import Final, TypedDict
+from typing import Final, TypedDict, Any
 
 import requests
 from tenacity import (
@@ -39,12 +39,14 @@ from tenacity import (
 # Configuration
 # ============================================================
 
+
 @dataclass(frozen=True, slots=True)
 class Config:
     API_URL: Final[str] = "https://api.etherscan.io/api"
     MIN_INTERVAL: Final[int] = 10
     RETRY_LIMIT: Final[int] = 5
     TIMEOUT: Final[int] = 10
+    USER_AGENT: Final[str] = "eth-gas-monitor/2.0"
     LOG_FORMAT: Final[str] = "%(asctime)s - %(levelname)s - %(message)s"
     LOG_DATE_FORMAT: Final[str] = "%H:%M:%S"
 
@@ -59,6 +61,7 @@ class ApiStatus(str, Enum):
 # Types
 # ============================================================
 
+
 class GasPrices(TypedDict):
     safe: int
     propose: int
@@ -68,6 +71,7 @@ class GasPrices(TypedDict):
 # ============================================================
 # Exceptions
 # ============================================================
+
 
 class EtherscanError(RuntimeError):
     """Logical API error returned by Etherscan."""
@@ -87,6 +91,10 @@ logger = logging.getLogger("eth-gas-monitor")
 def setup_logging(level: str) -> None:
     logger.handlers.clear()
 
+    normalized = level.upper()
+    if not hasattr(logging, normalized):
+        normalized = "INFO"
+
     try:
         from rich.logging import RichHandler
 
@@ -101,19 +109,20 @@ def setup_logging(level: str) -> None:
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.setLevel(getattr(logging, normalized))
 
 
 # ============================================================
 # HTTP Session
 # ============================================================
 
+
 def create_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(
         {
             "Accept": "application/json",
-            "User-Agent": "eth-gas-monitor/1.1",
+            "User-Agent": Config.USER_AGENT,
         }
     )
     atexit.register(session.close)
@@ -124,8 +133,9 @@ SESSION: Final[requests.Session] = create_session()
 
 
 # ============================================================
-# Fetch Logic
+# Fetch Logic (Network retry only)
 # ============================================================
+
 
 @retry(
     stop=stop_after_attempt(Config.RETRY_LIMIT),
@@ -144,51 +154,55 @@ def fetch_gas_prices(api_key: str) -> GasPrices:
             "apikey": api_key,
         },
     )
+
     response.raise_for_status()
 
     try:
-        payload = response.json()
+        payload: Any = response.json()
     except json.JSONDecodeError as exc:
         raise InvalidPayloadError("Invalid JSON from Etherscan") from exc
 
     if not isinstance(payload, dict):
-        raise InvalidPayloadError(f"Unexpected payload type: {type(payload)}")
+        raise InvalidPayloadError("Payload must be a JSON object")
 
-    if payload.get("status") != ApiStatus.OK:
+    status = payload.get("status")
+    if status != ApiStatus.OK.value:
         raise EtherscanError(
             f"{payload.get('message')} | {payload.get('result')}"
         )
 
     result = payload.get("result")
     if not isinstance(result, dict):
-        raise InvalidPayloadError("Missing or malformed result field")
+        raise InvalidPayloadError("Missing or malformed 'result' field")
 
-    try:
-        return GasPrices(
-            safe=int(result["SafeGasPrice"]),
-            propose=int(result["ProposeGasPrice"]),
-            fast=int(result["FastGasPrice"]),
-        )
-    except (KeyError, ValueError, TypeError) as exc:
-        raise InvalidPayloadError(
-            f"Invalid gas price values: {result!r}"
-        ) from exc
+    def parse_int(field: str) -> int:
+        value = result.get(field)
+        if not isinstance(value, str) or not value.isdigit():
+            raise InvalidPayloadError(f"Invalid value for {field}: {value!r}")
+        return int(value)
+
+    return GasPrices(
+        safe=parse_int("SafeGasPrice"),
+        propose=parse_int("ProposeGasPrice"),
+        fast=parse_int("FastGasPrice"),
+    )
 
 
 # ============================================================
 # Output
 # ============================================================
 
+
 def display_gas_prices(prices: GasPrices, as_json: bool) -> None:
     if as_json:
-        print(json.dumps(prices, indent=2))
+        print(json.dumps(prices, separators=(",", ":")))
         return
 
     try:
         from rich.console import Console
         from rich.table import Table
 
-        table = Table(title="⛽ Ethereum Gas Prices (Gwei)", expand=True)
+        table = Table(title="Ethereum Gas Prices (Gwei)", expand=True)
         for col in ("Safe", "Propose", "Fast"):
             table.add_column(col, justify="center")
 
@@ -201,7 +215,7 @@ def display_gas_prices(prices: GasPrices, as_json: bool) -> None:
         Console().print(table)
     except ImportError:
         logger.info(
-            "⛽ Gas | Safe=%d | Propose=%d | Fast=%d",
+            "Gas | Safe=%d | Propose=%d | Fast=%d",
             prices["safe"],
             prices["propose"],
             prices["fast"],
@@ -216,7 +230,7 @@ stop_event = Event()
 
 
 def handle_exit_signal(signum, _frame) -> None:
-    logger.info("Received signal %s, shutting down…", signum)
+    logger.info("Received signal %s — shutting down", signum)
     stop_event.set()
 
 
@@ -231,8 +245,9 @@ def normalize_interval(interval: int) -> int:
 
 
 # ============================================================
-# Main Loop
+# Main Loop (Drift-Free Scheduler)
 # ============================================================
+
 
 def run_monitor(
     api_key: str,
@@ -241,16 +256,19 @@ def run_monitor(
     as_json: bool,
 ) -> None:
     logger.info("Ethereum Gas Monitor started")
+
     interval = normalize_interval(interval)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, handle_exit_signal)
-        except Exception:
+        except (ValueError, OSError):
             pass
 
+    next_tick = time.monotonic()
+
     while not stop_event.is_set():
-        start_ts = time.monotonic()
+        start = time.monotonic()
 
         try:
             prices = fetch_gas_prices(api_key)
@@ -259,19 +277,25 @@ def run_monitor(
             logger.error("API error: %s", exc)
         except requests.RequestException as exc:
             logger.error("Network error: %s", exc)
-        except Exception as exc:
-            logger.exception("Unexpected failure: %s", exc)
+        except Exception:
+            logger.exception("Unexpected failure")
 
         if run_once:
             break
 
-        elapsed = time.monotonic() - start_ts
-        stop_event.wait(max(0.0, interval - elapsed))
+        next_tick += interval
+        sleep_for = max(0.0, next_tick - time.monotonic())
+        stop_event.wait(sleep_for)
+
+        # Hard realignment if system was paused/slept too long
+        if time.monotonic() - next_tick > interval:
+            next_tick = time.monotonic()
 
 
 # ============================================================
 # Entry Point
 # ============================================================
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -297,12 +321,17 @@ def main() -> None:
         logger.error("Missing Etherscan API key")
         sys.exit(1)
 
-    run_monitor(
-        api_key=args.api_key,
-        interval=args.interval,
-        run_once=args.once,
-        as_json=args.json,
-    )
+    try:
+        run_monitor(
+            api_key=args.api_key,
+            interval=args.interval,
+            run_once=args.once,
+            as_json=args.json,
+        )
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    finally:
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
