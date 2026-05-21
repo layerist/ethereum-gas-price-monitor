@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Ethereum Gas Price Monitor (Etherscan) — Production Grade
+Ethereum Gas Price Monitor — Production Grade (Improved)
 
-Key Improvements
-- True drift-free scheduler + optional jitter
-- Transport + logical retry separation
-- Rate-limit awareness (adaptive backoff)
-- Zero allocation hot loop (no dict copy)
-- Structured logging (JSON optional)
-- Metrics hooks (latency, errors)
-- Graceful shutdown (signal-safe)
-- Reusable rich table (no reallocation)
-- Optional API key rotation
+Features
+--------
+- Drift-free scheduler (monotonic)
+- Adaptive rate-limit handling
+- API key rotation + cooldown
+- Retry-After support
+- Rich terminal UI
+- Structured logging
+- Metrics tracking
+- Graceful shutdown
+- Hardened payload validation
+- Transport retry separation
+- Efficient hot loop
 """
 
 from __future__ import annotations
@@ -21,45 +24,47 @@ import atexit
 import json
 import logging
 import os
+import random
 import signal
 import sys
 import time
-import random
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from threading import Event
-from typing import Final, TypedDict, Any, Optional, Sequence
+from typing import TypedDict, Any, Final, Sequence
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ============================================================
-# Configuration
-# ============================================================
 
+# ============================================================
+# Config
+# ============================================================
 
 @dataclass(frozen=True, slots=True)
 class Config:
     API_URL: Final[str] = "https://api.etherscan.io/api"
 
-    MIN_INTERVAL: Final[int] = 10
+    USER_AGENT: Final[str] = "eth-gas-monitor/5.0"
 
     CONNECT_TIMEOUT: Final[int] = 5
     READ_TIMEOUT: Final[int] = 10
 
-    USER_AGENT: Final[str] = "eth-gas-monitor/4.0"
+    MIN_INTERVAL: Final[int] = 10
 
-    MAX_RETRIES: Final[int] = 3
+    MAX_TRANSPORT_RETRIES: Final[int] = 3
+    MAX_API_RETRIES: Final[int] = 3
 
-    # Logical retry (API-level)
-    MAX_API_RETRIES: Final[int] = 2
-    API_BACKOFF: Final[float] = 1.5
-
-    # Jitter (to avoid sync spikes)
+    API_BACKOFF_BASE: Final[float] = 1.7
     MAX_JITTER: Final[float] = 0.25
 
-    LOG_FORMAT: Final[str] = "%(asctime)s - %(levelname)s - %(message)s"
+    API_KEY_COOLDOWN: Final[int] = 60
+
+    LOG_FORMAT: Final[str] = (
+        "%(asctime)s - %(levelname)s - %(message)s"
+    )
     LOG_DATE_FORMAT: Final[str] = "%H:%M:%S"
 
 
@@ -71,17 +76,29 @@ class ApiStatus(str, Enum):
 # Types
 # ============================================================
 
-
 class GasPrices(TypedDict):
     safe: int
     propose: int
     fast: int
 
 
+@dataclass(slots=True)
+class Metrics:
+    requests: int = 0
+    failures: int = 0
+    rate_limits: int = 0
+    total_latency_ms: float = 0.0
+
+    @property
+    def avg_latency_ms(self) -> float:
+        if self.requests == 0:
+            return 0.0
+        return self.total_latency_ms / self.requests
+
+
 # ============================================================
 # Exceptions
 # ============================================================
-
 
 class EtherscanError(RuntimeError):
     pass
@@ -92,7 +109,9 @@ class InvalidPayloadError(ValueError):
 
 
 class RateLimitError(EtherscanError):
-    pass
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 # ============================================================
@@ -104,13 +123,19 @@ logger = logging.getLogger("eth-gas-monitor")
 
 def setup_logging(level: str, structured: bool) -> None:
     logger.handlers.clear()
-    lvl = logging._nameToLevel.get(level.upper(), logging.INFO)
+
+    lvl = logging._nameToLevel.get(
+        level.upper(),
+        logging.INFO
+    )
 
     handler = logging.StreamHandler()
 
     if structured:
         formatter = logging.Formatter(
-            '{"time":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}'
+            '{"time":"%(asctime)s",'
+            '"level":"%(levelname)s",'
+            '"message":"%(message)s"}'
         )
     else:
         formatter = logging.Formatter(
@@ -119,6 +144,7 @@ def setup_logging(level: str, structured: bool) -> None:
         )
 
     handler.setFormatter(formatter)
+
     logger.addHandler(handler)
     logger.setLevel(lvl)
 
@@ -127,22 +153,25 @@ def setup_logging(level: str, structured: bool) -> None:
 # HTTP Session
 # ============================================================
 
-
 def create_session() -> requests.Session:
     session = requests.Session()
 
     retry_strategy = Retry(
-        total=Config.MAX_RETRIES,
+        total=Config.MAX_TRANSPORT_RETRIES,
+        connect=Config.MAX_TRANSPORT_RETRIES,
+        read=Config.MAX_TRANSPORT_RETRIES,
         backoff_factor=0.5,
+        allowed_methods=frozenset({"GET"}),
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
         raise_on_status=False,
+        respect_retry_after_header=True,
     )
 
     adapter = HTTPAdapter(
-        pool_connections=10,
-        pool_maxsize=10,
+        pool_connections=20,
+        pool_maxsize=20,
         max_retries=retry_strategy,
+        pool_block=False,
     )
 
     session.mount("https://", adapter)
@@ -150,6 +179,8 @@ def create_session() -> requests.Session:
     session.headers.update(
         {
             "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
             "User-Agent": Config.USER_AGENT,
         }
     )
@@ -158,98 +189,177 @@ def create_session() -> requests.Session:
     return session
 
 
-SESSION: Final[requests.Session] = create_session()
+SESSION: Final = create_session()
 
-TIMEOUT: Final[tuple[int, int]] = (
+TIMEOUT: Final = (
     Config.CONNECT_TIMEOUT,
     Config.READ_TIMEOUT,
 )
-
-# Pre-allocated params (mutated in-place)
-PARAMS: Final[dict[str, str]] = {
-    "module": "gastracker",
-    "action": "gasoracle",
-    "apikey": "",
-}
 
 
 # ============================================================
 # Parsing
 # ============================================================
 
-
 def _parse_int(value: Any, field: str) -> int:
-    if isinstance(value, str) and value.isdigit():
+    try:
         return int(value)
-    raise InvalidPayloadError(f"Invalid {field}: {value!r}")
+    except (TypeError, ValueError):
+        raise InvalidPayloadError(
+            f"Invalid {field}: {value!r}"
+        )
 
 
 def parse_payload(payload: Any) -> GasPrices:
     if not isinstance(payload, dict):
-        raise InvalidPayloadError("Payload must be object")
+        raise InvalidPayloadError(
+            "Payload must be object"
+        )
 
     if payload.get("status") != ApiStatus.OK.value:
-        msg = payload.get("message", "")
-        result = payload.get("result", "")
+        result = str(payload.get("result", ""))
+        message = str(payload.get("message", ""))
 
-        if "rate limit" in str(result).lower():
+        if "rate limit" in result.lower():
             raise RateLimitError(result)
 
-        raise EtherscanError(f"{msg} | {result}")
+        raise EtherscanError(
+            f"{message} | {result}"
+        )
 
     result = payload.get("result")
+
     if not isinstance(result, dict):
-        raise InvalidPayloadError("Missing result")
+        raise InvalidPayloadError(
+            "Missing result"
+        )
 
     return {
-        "safe": _parse_int(result.get("SafeGasPrice"), "SafeGasPrice"),
-        "propose": _parse_int(result.get("ProposeGasPrice"), "ProposeGasPrice"),
-        "fast": _parse_int(result.get("FastGasPrice"), "FastGasPrice"),
+        "safe": _parse_int(
+            result.get("SafeGasPrice"),
+            "SafeGasPrice"
+        ),
+        "propose": _parse_int(
+            result.get("ProposeGasPrice"),
+            "ProposeGasPrice"
+        ),
+        "fast": _parse_int(
+            result.get("FastGasPrice"),
+            "FastGasPrice"
+        ),
     }
 
 
 # ============================================================
-# Fetch with API-level retry
+# API Key Rotation
 # ============================================================
 
+class ApiKeyPool:
+    def __init__(self, keys: Sequence[str]):
+        self._keys = deque(keys)
+        self._cooldowns: dict[str, float] = {}
 
-def fetch_gas_prices(api_key: str) -> GasPrices:
-    PARAMS["apikey"] = api_key
+    def get(self) -> str:
+        now = time.monotonic()
 
-    for attempt in range(Config.MAX_API_RETRIES + 1):
-        start = time.perf_counter()
+        for _ in range(len(self._keys)):
+            key = self._keys[0]
+            self._keys.rotate(-1)
 
-        response = SESSION.get(
-            Config.API_URL,
-            params=PARAMS,
-            timeout=TIMEOUT,
+            cooldown_until = (
+                self._cooldowns.get(key, 0)
+            )
+
+            if cooldown_until <= now:
+                return key
+
+        raise RateLimitError(
+            "All API keys cooling down"
         )
 
-        latency = time.perf_counter() - start
+    def cooldown(self, key: str) -> None:
+        self._cooldowns[key] = (
+            time.monotonic()
+            + Config.API_KEY_COOLDOWN
+        )
+
+
+# ============================================================
+# Fetch
+# ============================================================
+
+def fetch_gas_prices(
+    api_key: str,
+    metrics: Metrics,
+) -> GasPrices:
+
+    params = {
+        "module": "gastracker",
+        "action": "gasoracle",
+        "apikey": api_key,
+    }
+
+    for attempt in range(
+        Config.MAX_API_RETRIES + 1
+    ):
+
+        started_ns = time.perf_counter_ns()
 
         try:
+            response = SESSION.get(
+                Config.API_URL,
+                params=params,
+                timeout=TIMEOUT,
+            )
+
+            latency_ms = (
+                time.perf_counter_ns()
+                - started_ns
+            ) / 1_000_000
+
+            metrics.requests += 1
+            metrics.total_latency_ms += latency_ms
+
             response.raise_for_status()
+
             payload = response.json()
+
             result = parse_payload(payload)
 
-            logger.debug("Latency: %.3fs", latency)
+            logger.debug(
+                "Latency: %.2f ms",
+                latency_ms
+            )
+
             return result
 
-        except RateLimitError as exc:
-            if attempt >= Config.MAX_API_RETRIES:
-                raise
-            sleep_time = Config.API_BACKOFF ** attempt
-            logger.warning("Rate limited, retrying in %.2fs", sleep_time)
-            time.sleep(sleep_time)
+        except RateLimitError:
+            metrics.rate_limits += 1
 
-        except (json.JSONDecodeError, InvalidPayloadError):
-            raise
+            if (
+                attempt
+                >= Config.MAX_API_RETRIES
+            ):
+                raise
+
+            retry_after = (
+                Config.API_BACKOFF_BASE
+                ** attempt
+            )
+
+            logger.warning(
+                "Rate limited "
+                "(retry %.2fs)",
+                retry_after
+            )
+
+            time.sleep(retry_after)
 
     raise RuntimeError("Unreachable")
 
 
 # ============================================================
-# Output (optimized)
+# Output
 # ============================================================
 
 USE_RICH = False
@@ -259,37 +369,67 @@ try:
     from rich.table import Table
 
     console = Console()
-
-    TABLE = Table(title="Gas (Gwei)", expand=True)
-    TABLE.add_column("Safe", justify="center")
-    TABLE.add_column("Propose", justify="center")
-    TABLE.add_column("Fast", justify="center")
-
     USE_RICH = True
+
 except ImportError:
     console = None
 
 
-def display(prices: GasPrices, as_json: bool, as_csv: bool) -> None:
+def display(
+    prices: GasPrices,
+    as_json: bool,
+    as_csv: bool,
+) -> None:
+
     if as_json:
-        print(json.dumps(prices, separators=(",", ":")))
+        print(
+            json.dumps(
+                prices,
+                separators=(",", ":")
+            )
+        )
         return
 
     if as_csv:
-        print(f"{prices['safe']},{prices['propose']},{prices['fast']}")
+        print(
+            f"{prices['safe']},"
+            f"{prices['propose']},"
+            f"{prices['fast']}"
+        )
         return
 
     if USE_RICH:
-        TABLE.rows.clear()
-        TABLE.add_row(
+        table = Table(
+            title="Ethereum Gas (Gwei)",
+            expand=True
+        )
+
+        table.add_column(
+            "Safe",
+            justify="center"
+        )
+        table.add_column(
+            "Propose",
+            justify="center"
+        )
+        table.add_column(
+            "Fast",
+            justify="center"
+        )
+
+        table.add_row(
             str(prices["safe"]),
             str(prices["propose"]),
-            str(prices["fast"],
+            str(prices["fast"]),
         )
-        console.print(TABLE)
+
+        console.print(table)
+
     else:
         logger.info(
-            "Gas | Safe=%d | Propose=%d | Fast=%d",
+            "Gas | Safe=%d "
+            "| Propose=%d "
+            "| Fast=%d",
             prices["safe"],
             prices["propose"],
             prices["fast"],
@@ -297,25 +437,35 @@ def display(prices: GasPrices, as_json: bool, as_csv: bool) -> None:
 
 
 # ============================================================
-# Runtime Control
+# Runtime
 # ============================================================
 
 stop_event = Event()
 
 
-def handle_exit_signal(signum, _frame) -> None:
-    logger.info("Signal %s received — shutting down", signum)
+def handle_exit_signal(
+    signum,
+    _frame
+) -> None:
+    logger.info(
+        "Signal %s received",
+        signum
+    )
     stop_event.set()
 
 
-def normalize_interval(interval: int) -> int:
-    return max(interval, Config.MIN_INTERVAL)
+def normalize_interval(
+    interval: int
+) -> int:
+    return max(
+        interval,
+        Config.MIN_INTERVAL
+    )
 
 
 # ============================================================
-# Scheduler (drift-free + jitter)
+# Monitor Loop
 # ============================================================
-
 
 def run_monitor(
     api_keys: Sequence[str],
@@ -325,79 +475,180 @@ def run_monitor(
     as_csv: bool,
 ) -> None:
 
-    logger.info("Started Ethereum Gas Monitor")
+    logger.info(
+        "Started Ethereum Gas Monitor"
+    )
 
-    interval = normalize_interval(interval)
+    interval = normalize_interval(
+        interval
+    )
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(sig, handle_exit_signal)
-        except Exception:
-            pass
+    metrics = Metrics()
+    key_pool = ApiKeyPool(api_keys)
 
-    start = time.monotonic()
+    start_time = time.monotonic()
     tick = 0
-    key_index = 0
 
     while not stop_event.is_set():
 
-        api_key = api_keys[key_index]
-        key_index = (key_index + 1) % len(api_keys)
-
         try:
-            prices = fetch_gas_prices(api_key)
-            display(prices, as_json, as_csv)
+            api_key = key_pool.get()
+
+            prices = fetch_gas_prices(
+                api_key,
+                metrics,
+            )
+
+            display(
+                prices,
+                as_json,
+                as_csv,
+            )
 
         except RateLimitError:
-            logger.warning("All retries exhausted (rate limit)")
+            logger.warning(
+                "Key exhausted, cooling down"
+            )
+
+            try:
+                key_pool.cooldown(api_key)
+            except Exception:
+                pass
 
         except requests.RequestException as exc:
-            logger.error("Network error: %s", exc)
+            metrics.failures += 1
+            logger.error(
+                "Network error: %s",
+                exc,
+            )
 
         except Exception:
-            logger.exception("Unexpected error")
+            metrics.failures += 1
+            logger.exception(
+                "Unexpected error"
+            )
 
         if run_once:
             break
 
         tick += 1
 
-        next_time = start + tick * interval
+        next_run = (
+            start_time
+            + tick * interval
+        )
 
-        # Add jitter
-        jitter = random.uniform(0, Config.MAX_JITTER)
-        sleep_time = next_time - time.monotonic() + jitter
+        jitter = random.uniform(
+            0,
+            Config.MAX_JITTER,
+        )
 
-        if sleep_time > 0:
-            stop_event.wait(sleep_time)
+        sleep_for = (
+            next_run
+            - time.monotonic()
+            + jitter
+        )
+
+        if sleep_for > 0:
+            stop_event.wait(sleep_for)
+
+    logger.info(
+        "Metrics | req=%d "
+        "| fail=%d "
+        "| rate_limit=%d "
+        "| avg_latency=%.2fms",
+        metrics.requests,
+        metrics.failures,
+        metrics.rate_limits,
+        metrics.avg_latency_ms,
+    )
 
 
 # ============================================================
-# Entry Point
+# Main
 # ============================================================
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ethereum Gas Monitor")
 
-    parser.add_argument("--api-key", action="append")
-    parser.add_argument("--interval", type=int, default=60)
-    parser.add_argument("--log-level", default="INFO")
+    parser = argparse.ArgumentParser(
+        description="Ethereum Gas Monitor"
+    )
 
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--csv", action="store_true")
-    parser.add_argument("--structured-logs", action="store_true")
+    parser.add_argument(
+        "--api-key",
+        action="append",
+    )
+
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+    )
+
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+    )
+
+    parser.add_argument(
+        "--once",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--json",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--csv",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--structured-logs",
+        action="store_true",
+    )
 
     args = parser.parse_args()
 
-    setup_logging(args.log_level, args.structured_logs)
+    setup_logging(
+        args.log_level,
+        args.structured_logs,
+    )
 
-    api_keys = args.api_key or [os.getenv("ETHERSCAN_API_KEY")]
+    api_keys = (
+        args.api_key
+        or [
+            os.getenv(
+                "ETHERSCAN_API_KEY"
+            )
+        ]
+    )
 
-    if not api_keys or not api_keys[0]:
-        logger.error("Missing API key")
+    api_keys = [
+        x.strip()
+        for x in api_keys
+        if x and x.strip()
+    ]
+
+    if not api_keys:
+        logger.error(
+            "Missing API key"
+        )
         sys.exit(1)
+
+    for sig in (
+        signal.SIGINT,
+        signal.SIGTERM,
+    ):
+        try:
+            signal.signal(
+                sig,
+                handle_exit_signal
+            )
+        except Exception:
+            pass
 
     try:
         run_monitor(
@@ -407,10 +658,16 @@ def main() -> None:
             as_json=args.json,
             as_csv=args.csv,
         )
+
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
+        logger.info(
+            "Interrupted by user"
+        )
+
     finally:
-        logger.info("Shutdown complete")
+        logger.info(
+            "Shutdown complete"
+        )
 
 
 if __name__ == "__main__":
