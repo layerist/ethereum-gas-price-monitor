@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ethereum Gas Price Monitor — v6
+Ethereum Gas Price Monitor — v7
 
 Highlights
 ----------
@@ -12,7 +12,9 @@ Highlights
 - Drift-resistant monotonic scheduler with overrun recovery
 - JSON, JSONL, CSV and terminal output
 - Valid structured JSON logging
-- Optional proxy, output file and CSV header
+- Optional proxy, output file and non-duplicating CSV header
+- Retry-After HTTP-date support and stricter CLI validation
+- Thread-safe API-key pool and accurate failed-request latency metrics
 - Atomic, testable components and graceful shutdown
 
 Requires: requests
@@ -28,21 +30,24 @@ import logging
 import os
 import random
 import signal
+from datetime import timezone
 import sys
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
-from threading import Event
-from typing import Any, Final, Iterable, Mapping, Sequence, TextIO
+from threading import Event, Lock
+from typing import Any, Final, Mapping, Sequence, TextIO
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 APP_NAME: Final = "eth-gas-monitor"
-APP_VERSION: Final = "6.0"
+APP_VERSION: Final = "7.0"
 DEFAULT_API_URL: Final = "https://api.etherscan.io/v2/api"
 DEFAULT_CHAIN_ID: Final = "1"
 DEFAULT_TIMEOUT: Final = (5.0, 10.0)
@@ -258,11 +263,20 @@ def parse_payload(payload: Any) -> GasPrices:
 
 
 def parse_retry_after(value: str | None) -> float | None:
+    """Parse Retry-After as delta-seconds or an HTTP date."""
     if not value:
         return None
+    raw = value.strip()
     try:
-        return max(0.0, float(value.strip()))
+        return max(0.0, float(raw))
     except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, retry_at.timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -275,27 +289,32 @@ class ApiKeyPool:
         self._default_cooldown = default_cooldown
         self._cooldowns: dict[str, float] = {}
         self._cursor = 0
+        self._lock = Lock()
 
     def acquire(self) -> str:
-        now = time.monotonic()
-        count = len(self._keys)
-        for offset in range(count):
-            index = (self._cursor + offset) % count
-            key = self._keys[index]
-            if self._cooldowns.get(key, 0.0) <= now:
-                self._cursor = (index + 1) % count
-                return key
-        raise AllKeysCoolingDown(
-            "All API keys are cooling down", retry_after=self.seconds_until_available()
-        )
+        with self._lock:
+            now = time.monotonic()
+            count = len(self._keys)
+            for offset in range(count):
+                index = (self._cursor + offset) % count
+                key = self._keys[index]
+                if self._cooldowns.get(key, 0.0) <= now:
+                    self._cursor = (index + 1) % count
+                    return key
+            retry_after = self._seconds_until_available_unlocked(now)
+        raise AllKeysCoolingDown("All API keys are cooling down", retry_after=retry_after)
 
     def cooldown(self, key: str, seconds: float | None = None) -> None:
         duration = self._default_cooldown if seconds is None else max(0.0, seconds)
-        self._cooldowns[key] = time.monotonic() + duration
+        with self._lock:
+            self._cooldowns[key] = time.monotonic() + duration
+
+    def _seconds_until_available_unlocked(self, now: float) -> float:
+        return max(0.0, min(self._cooldowns.get(k, now) for k in self._keys) - now)
 
     def seconds_until_available(self) -> float:
-        now = time.monotonic()
-        return max(0.0, min(self._cooldowns.get(k, now) for k in self._keys) - now)
+        with self._lock:
+            return self._seconds_until_available_unlocked(time.monotonic())
 
     def __len__(self) -> int:
         return len(self._keys)
@@ -320,9 +339,7 @@ class EtherscanClient:
             response = self.session.get(
                 self.settings.api_url, params=params, timeout=self.settings.timeout
             )
-            latency_ms = (time.perf_counter() - started) * 1000.0
-            self.metrics.total_latency_ms += latency_ms
-            logger.debug("HTTP %s in %.2f ms", response.status_code, latency_ms)
+            logger.debug("HTTP %s", response.status_code)
 
             retry_after = parse_retry_after(response.headers.get("Retry-After"))
             if response.status_code == 429:
@@ -349,6 +366,8 @@ class EtherscanClient:
         except Exception:
             self.metrics.failures += 1
             raise
+        finally:
+            self.metrics.total_latency_ms += (time.perf_counter() - started) * 1000.0
 
 
 def interruptible_wait(seconds: float) -> bool:
@@ -424,6 +443,7 @@ class OutputWriter:
         self.flush = flush
         self._csv = csv.writer(stream, lineterminator="\n") if mode == "csv" else None
         self._header_written = False
+        self._console: Any | None = None
         if mode == "csv" and include_header:
             self._write_csv_header()
 
@@ -477,6 +497,8 @@ class OutputWriter:
             )
             return
 
+        if self._console is None:
+            self._console = Console(file=self.stream)
         table = Table(title="Ethereum Gas (Gwei)")
         for column in ("Safe", "Propose", "Fast", "Base fee"):
             table.add_column(column, justify="right")
@@ -486,7 +508,7 @@ class OutputWriter:
             _decimal_text(prices.fast),
             _decimal_text(prices.suggest_base_fee) if prices.suggest_base_fee is not None else "—",
         )
-        Console(file=self.stream).print(table)
+        self._console.print(table)
 
 
 def run_monitor(
@@ -542,7 +564,8 @@ def env_api_keys() -> list[str]:
     if single:
         values.append(single)
     if multiple:
-        values.extend(multiple.split(","))
+        normalized = multiple.replace(";", ",").replace("\n", ",")
+        values.extend(normalized.split(","))
     return [value.strip() for value in values if value.strip()]
 
 
@@ -560,11 +583,28 @@ def nonnegative_int(value: str) -> int:
     return parsed
 
 
+def positive_int_text(value: str) -> str:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return str(parsed)
+
+
+def http_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise argparse.ArgumentTypeError("must be an absolute http(s) URL")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Monitor Etherscan gas-price recommendations")
     parser.add_argument("--api-key", action="append", default=[], help="repeat for multiple keys")
-    parser.add_argument("--chain-id", default=os.getenv("ETHERSCAN_CHAIN_ID", DEFAULT_CHAIN_ID))
-    parser.add_argument("--api-url", default=os.getenv("ETHERSCAN_API_URL", DEFAULT_API_URL))
+    parser.add_argument("--chain-id", type=positive_int_text, default=os.getenv("ETHERSCAN_CHAIN_ID", DEFAULT_CHAIN_ID))
+    parser.add_argument("--api-url", type=http_url, default=os.getenv("ETHERSCAN_API_URL", DEFAULT_API_URL))
     parser.add_argument("--interval", type=positive_float, default=60.0)
     parser.add_argument("--min-interval", type=positive_float, default=DEFAULT_MIN_INTERVAL)
     parser.add_argument("--connect-timeout", type=positive_float, default=DEFAULT_TIMEOUT[0])
@@ -576,7 +616,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--output", type=Path, help="append output to this file")
     parser.add_argument("--no-flush", action="store_true", help="do not flush after every sample")
-    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"), default="INFO")
     parser.add_argument("--structured-logs", action="store_true")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
 
@@ -600,6 +640,7 @@ def install_signal_handlers() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    stop_event.clear()
     args = build_parser().parse_args(argv)
     setup_logging(args.log_level, args.structured_logs)
     install_signal_handlers()
@@ -625,8 +666,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     owned_stream: TextIO | None = None
 
     try:
+        output_was_empty = True
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
+            output_was_empty = not args.output.exists() or args.output.stat().st_size == 0
             owned_stream = args.output.open("a", encoding="utf-8", newline="")
             stream = owned_stream
 
@@ -634,7 +677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         writer = OutputWriter(
             mode=mode,
             stream=stream,
-            include_header=not args.no_csv_header,
+            include_header=not args.no_csv_header and output_was_empty,
             flush=not args.no_flush,
         )
         client = EtherscanClient(session, settings, metrics)
