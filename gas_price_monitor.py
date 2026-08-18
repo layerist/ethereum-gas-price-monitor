@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ethereum Gas Price Monitor — v7
+Ethereum Gas Price Monitor — v8
 
 Highlights
 ----------
@@ -15,6 +15,11 @@ Highlights
 - Optional proxy, output file and non-duplicating CSV header
 - Retry-After HTTP-date support and stricter CLI validation
 - Thread-safe API-key pool and accurate failed-request latency metrics
+- Rate-limit rotation independent from transient retry budget
+- Permanent invalid-key quarantine without poisoning healthy keys
+- Finite-number CLI validation (rejects NaN/Inf)
+- Non-zero one-shot exit status on failed sample
+- Fatal output errors instead of silent data loss
 - Atomic, testable components and graceful shutdown
 
 Requires: requests
@@ -27,6 +32,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import random
 import signal
@@ -47,7 +53,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 APP_NAME: Final = "eth-gas-monitor"
-APP_VERSION: Final = "7.0"
+APP_VERSION: Final = "8.0"
 DEFAULT_API_URL: Final = "https://api.etherscan.io/v2/api"
 DEFAULT_CHAIN_ID: Final = "1"
 DEFAULT_TIMEOUT: Final = (5.0, 10.0)
@@ -144,7 +150,17 @@ class AllKeysCoolingDown(RateLimitError):
     pass
 
 
+class NoUsableApiKeys(EtherscanError):
+    pass
+
+
+class PermanentApiKeyError(EtherscanError):
+    pass
+
+
 class JsonFormatter(logging.Formatter):
+    converter = time.gmtime
+
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
@@ -226,9 +242,24 @@ def _parse_ratio(value: Any) -> tuple[Decimal, ...]:
     return tuple(_parse_decimal(item, "gasUsedRatio") for item in parts)
 
 
+def _joined_lower(*values: Any) -> str:
+    return " ".join(str(v) for v in values if v is not None).lower()
+
+
 def _looks_rate_limited(*values: Any) -> bool:
-    text = " ".join(str(v) for v in values if v is not None).lower()
+    text = _joined_lower(*values)
     markers = ("rate limit", "max rate", "too many request", "throttl")
+    return any(marker in text for marker in markers)
+
+
+def _looks_invalid_api_key(*values: Any) -> bool:
+    text = _joined_lower(*values)
+    markers = (
+        "invalid api key",
+        "missing/invalid api key",
+        "api key not activated",
+        "invalidapikey",
+    )
     return any(marker in text for marker in markers)
 
 
@@ -243,6 +274,8 @@ def parse_payload(payload: Any) -> GasPrices:
     if status != ApiStatus.OK.value:
         if _looks_rate_limited(message, result):
             raise RateLimitError(str(result or message or "Rate limited"))
+        if _looks_invalid_api_key(message, result):
+            raise PermanentApiKeyError(str(result or message or "Invalid API key"))
         raise EtherscanError(f"Etherscan error: {message!s} | {result!s}")
 
     if not isinstance(result, Mapping):
@@ -268,7 +301,9 @@ def parse_retry_after(value: str | None) -> float | None:
         return None
     raw = value.strip()
     try:
-        return max(0.0, float(raw))
+        seconds = float(raw)
+        if math.isfinite(seconds):
+            return max(0.0, seconds)
     except ValueError:
         pass
     try:
@@ -288,6 +323,7 @@ class ApiKeyPool:
         self._keys = unique_keys
         self._default_cooldown = default_cooldown
         self._cooldowns: dict[str, float] = {}
+        self._disabled: set[str] = set()
         self._cursor = 0
         self._lock = Lock()
 
@@ -295,26 +331,50 @@ class ApiKeyPool:
         with self._lock:
             now = time.monotonic()
             count = len(self._keys)
+            usable = 0
             for offset in range(count):
                 index = (self._cursor + offset) % count
                 key = self._keys[index]
+                if key in self._disabled:
+                    continue
+                usable += 1
                 if self._cooldowns.get(key, 0.0) <= now:
                     self._cursor = (index + 1) % count
                     return key
+            if usable == 0:
+                raise NoUsableApiKeys("All API keys are disabled")
             retry_after = self._seconds_until_available_unlocked(now)
         raise AllKeysCoolingDown("All API keys are cooling down", retry_after=retry_after)
 
     def cooldown(self, key: str, seconds: float | None = None) -> None:
         duration = self._default_cooldown if seconds is None else max(0.0, seconds)
         with self._lock:
-            self._cooldowns[key] = time.monotonic() + duration
+            if key not in self._disabled:
+                self._cooldowns[key] = time.monotonic() + duration
+
+    def disable(self, key: str) -> None:
+        with self._lock:
+            self._disabled.add(key)
+            self._cooldowns.pop(key, None)
 
     def _seconds_until_available_unlocked(self, now: float) -> float:
-        return max(0.0, min(self._cooldowns.get(k, now) for k in self._keys) - now)
+        deadlines = [
+            self._cooldowns.get(key, now)
+            for key in self._keys
+            if key not in self._disabled
+        ]
+        if not deadlines:
+            return 0.0
+        return max(0.0, min(deadlines) - now)
 
     def seconds_until_available(self) -> float:
         with self._lock:
             return self._seconds_until_available_unlocked(time.monotonic())
+
+    @property
+    def enabled_count(self) -> int:
+        with self._lock:
+            return len(self._keys) - len(self._disabled)
 
     def __len__(self) -> int:
         return len(self._keys)
@@ -345,6 +405,8 @@ class EtherscanClient:
             if response.status_code == 429:
                 self.metrics.rate_limits += 1
                 raise RateLimitError("HTTP 429 Too Many Requests", retry_after)
+            if response.status_code == 401:
+                raise PermanentApiKeyError("HTTP 401 Unauthorized")
 
             response.raise_for_status()
             try:
@@ -376,11 +438,11 @@ def interruptible_wait(seconds: float) -> bool:
 
 
 def backoff_delay(attempt: int, settings: Settings, retry_after: float | None) -> float:
-    if retry_after is not None:
-        base = retry_after
-    else:
-        base = settings.backoff_base**attempt
     jitter = random.uniform(0.0, settings.max_jitter)
+    if retry_after is not None:
+        # Retry-After is a server instruction. Do not cap it below the requested wait.
+        return max(0.0, retry_after) + jitter
+    base = settings.backoff_base**attempt
     return min(settings.max_backoff, base + jitter)
 
 
@@ -389,45 +451,74 @@ def fetch_with_rotation(
     key_pool: ApiKeyPool,
     settings: Settings,
 ) -> GasPrices:
+    """Fetch one sample with key rotation and bounded transient retries.
+
+    Rate-limited or permanently-invalid keys do not consume the transient retry
+    budget: healthy keys in a larger pool still get a chance in the same sample.
+    """
     last_error: BaseException | None = None
-    attempts = max(1, settings.api_retries + 1)
+    transient_failures = 0
+    cooldown_waits = 0
 
-    for attempt in range(attempts):
-        if stop_event.is_set():
-            raise InterruptedError("Shutdown requested")
-
+    while not stop_event.is_set():
         try:
             key = key_pool.acquire()
+        except NoUsableApiKeys:
+            raise
         except AllKeysCoolingDown as exc:
             last_error = exc
-            if attempt == attempts - 1:
+            if cooldown_waits >= settings.api_retries:
                 raise
-            delay = backoff_delay(attempt, settings, exc.retry_after)
-            logger.warning("All API keys cooling down; retrying in %.2fs", delay)
+            cooldown_waits += 1
+            delay = backoff_delay(cooldown_waits - 1, settings, exc.retry_after)
+            logger.warning(
+                "All enabled API keys cooling down; retrying in %.2fs", delay
+            )
             if interruptible_wait(delay):
                 raise InterruptedError("Shutdown requested")
             continue
 
         try:
             return client.get_gas_prices(key)
+        except PermanentApiKeyError as exc:
+            last_error = exc
+            key_pool.disable(key)
+            logger.error(
+                "API key rejected permanently; disabled for this process (%d/%d enabled)",
+                key_pool.enabled_count,
+                len(key_pool),
+            )
+            continue
         except RateLimitError as exc:
             last_error = exc
-            cooldown = exc.retry_after or settings.key_cooldown
+            cooldown = (
+                exc.retry_after
+                if exc.retry_after is not None and exc.retry_after > 0.0
+                else settings.key_cooldown
+            )
             key_pool.cooldown(key, cooldown)
             logger.warning("API key rate-limited; cooling it for %.2fs", cooldown)
-            # Immediately try another available key; only sleep when all keys are unavailable.
+            # Try another ready key immediately. This does not consume api_retries.
             continue
         except (requests.RequestException, InvalidPayloadError, EtherscanError) as exc:
             last_error = exc
-            if attempt == attempts - 1:
+            if transient_failures >= settings.api_retries:
                 raise
-            delay = backoff_delay(attempt, settings, None)
-            logger.warning("Request failed (%s); retrying in %.2fs", exc, delay)
+            delay = backoff_delay(transient_failures, settings, None)
+            transient_failures += 1
+            logger.warning(
+                "Request failed (%s); retry %d/%d in %.2fs",
+                exc,
+                transient_failures,
+                settings.api_retries,
+                delay,
+            )
             if interruptible_wait(delay):
                 raise InterruptedError("Shutdown requested")
 
-    assert last_error is not None
-    raise EtherscanError("Gas request failed") from last_error
+    if last_error is not None:
+        raise EtherscanError("Gas request failed") from last_error
+    raise InterruptedError("Shutdown requested")
 
 
 class OutputWriter:
@@ -518,7 +609,8 @@ def run_monitor(
     settings: Settings,
     interval: float,
     run_once: bool,
-) -> None:
+) -> bool:
+    """Run monitor; return whether at least one sample was written successfully."""
     interval = max(interval, settings.min_interval)
     logger.info(
         "Started %s v%s | chain=%s | interval=%.3fs | keys=%d",
@@ -530,10 +622,10 @@ def run_monitor(
     )
 
     next_run = time.monotonic()
+    had_success = False
     while not stop_event.is_set():
         try:
             prices = fetch_with_rotation(client, key_pool, settings)
-            writer.write(prices, settings.chain_id)
         except InterruptedError:
             break
         except requests.RequestException as exc:
@@ -541,7 +633,12 @@ def run_monitor(
         except EtherscanError as exc:
             logger.error("Etherscan error: %s", exc)
         except Exception:
-            logger.exception("Unexpected error")
+            logger.exception("Unexpected fetch error")
+        else:
+            # Output errors are intentionally fatal. Continuing after disk-full, broken
+            # pipe, encoding or filesystem errors would silently lose samples.
+            writer.write(prices, settings.chain_id)
+            had_success = True
 
         if run_once:
             break
@@ -549,12 +646,13 @@ def run_monitor(
         next_run += interval
         now = time.monotonic()
         if next_run <= now:
-            # Skip missed ticks instead of firing a burst after a long request/outage.
             missed = int((now - next_run) // interval) + 1
             next_run += missed * interval
             logger.debug("Skipped %d overdue scheduler tick(s)", missed)
         if interruptible_wait(next_run - time.monotonic()):
             break
+
+    return had_success
 
 
 def env_api_keys() -> list[str]:
@@ -570,9 +668,12 @@ def env_api_keys() -> list[str]:
 
 
 def positive_float(value: str) -> float:
-    parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
     return parsed
 
 
@@ -682,8 +783,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         client = EtherscanClient(session, settings, metrics)
         key_pool = ApiKeyPool(keys, settings.key_cooldown)
-        run_monitor(client, key_pool, writer, settings, args.interval, args.once)
+        had_success = run_monitor(
+            client, key_pool, writer, settings, args.interval, args.once
+        )
+        if args.once and not had_success:
+            return 1
         return 0
+    except (OSError, UnicodeError) as exc:
+        logger.error("Output error: %s", exc)
+        return 1
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         return 130
