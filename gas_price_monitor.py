@@ -22,8 +22,6 @@ Highlights
 - Fatal output errors instead of silent data loss
 - Atomic, testable components and graceful shutdown
 
-Requires: requests
-Optional: rich
 """
 
 from __future__ import annotations
