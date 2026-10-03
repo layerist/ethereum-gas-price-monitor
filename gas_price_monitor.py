@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ethereum Gas Price Monitor — v8
+Ethereum Gas Price Monitor — v9
 
 Highlights
 ----------
@@ -21,6 +21,10 @@ Highlights
 - Non-zero one-shot exit status on failed sample
 - Fatal output errors instead of silent data loss
 - Atomic, testable components and graceful shutdown
+- Single interruptible retry layer with explicit retry classification
+- Retryable HTTP status handling with Retry-After propagation
+- Configurable backoff/jitter and validated proxy URLs
+- Safer response previews and richer metrics
 
 """
 
@@ -51,7 +55,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 APP_NAME: Final = "eth-gas-monitor"
-APP_VERSION: Final = "8.0"
+APP_VERSION: Final = "9.0"
 DEFAULT_API_URL: Final = "https://api.etherscan.io/v2/api"
 DEFAULT_CHAIN_ID: Final = "1"
 DEFAULT_TIMEOUT: Final = (5.0, 10.0)
@@ -118,6 +122,10 @@ class Metrics:
     successes: int = 0
     failures: int = 0
     rate_limits: int = 0
+    transient_http_errors: int = 0
+    transport_errors: int = 0
+    invalid_payloads: int = 0
+    invalid_keys: int = 0
     total_latency_ms: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
 
@@ -156,6 +164,12 @@ class PermanentApiKeyError(EtherscanError):
     pass
 
 
+class TransientHttpError(EtherscanError):
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class JsonFormatter(logging.Formatter):
     converter = time.gmtime
 
@@ -187,20 +201,9 @@ def setup_logging(level: str, structured: bool) -> None:
 
 
 def create_session(settings: Settings, proxy: str | None = None) -> requests.Session:
-    # Retry only transport/server failures here. 429 is handled at application level
-    # so key rotation and metrics remain accurate.
-    retry = Retry(
-        total=settings.transport_retries,
-        connect=settings.transport_retries,
-        read=settings.transport_retries,
-        status=settings.transport_retries,
-        backoff_factor=0.5,
-        allowed_methods=frozenset({"GET"}),
-        status_forcelist=(500, 502, 503, 504),
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    # Keep retries in the application layer so waits are interruptible, key rotation is
+    # deterministic, and every logical HTTP attempt is represented in Metrics.
+    adapter = HTTPAdapter(max_retries=Retry(total=0), pool_connections=4, pool_maxsize=4)
     session = requests.Session()
     session.mount("https://", adapter)
     session.mount("http://", adapter)
@@ -404,13 +407,20 @@ class EtherscanClient:
                 self.metrics.rate_limits += 1
                 raise RateLimitError("HTTP 429 Too Many Requests", retry_after)
             if response.status_code == 401:
+                self.metrics.invalid_keys += 1
                 raise PermanentApiKeyError("HTTP 401 Unauthorized")
+            if response.status_code in {408, 425, 500, 502, 503, 504}:
+                self.metrics.transient_http_errors += 1
+                raise TransientHttpError(
+                    f"HTTP {response.status_code} {response.reason}", retry_after
+                )
 
             response.raise_for_status()
             try:
                 payload = response.json()
             except requests.exceptions.JSONDecodeError as exc:
-                preview = response.text[:200].replace("\n", " ")
+                self.metrics.invalid_payloads += 1
+                preview = response.text[:200].replace("\r", " ").replace("\n", " ")
                 raise InvalidPayloadError(f"Non-JSON response: {preview!r}") from exc
 
             try:
@@ -419,6 +429,12 @@ class EtherscanClient:
                 self.metrics.rate_limits += 1
                 if exc.retry_after is None:
                     exc.retry_after = retry_after
+                raise
+            except PermanentApiKeyError:
+                self.metrics.invalid_keys += 1
+                raise
+            except InvalidPayloadError:
+                self.metrics.invalid_payloads += 1
                 raise
 
             self.metrics.successes += 1
@@ -449,13 +465,15 @@ def fetch_with_rotation(
     key_pool: ApiKeyPool,
     settings: Settings,
 ) -> GasPrices:
-    """Fetch one sample with key rotation and bounded transient retries.
+    """Fetch one sample with key rotation and bounded, interruptible retries.
 
-    Rate-limited or permanently-invalid keys do not consume the transient retry
-    budget: healthy keys in a larger pool still get a chance in the same sample.
+    Rate-limited and permanently-invalid keys do not consume transient budgets.
+    Transport/HTTP failures use ``transport_retries``; valid HTTP responses with
+    malformed/transient API payloads use ``api_retries``.
     """
     last_error: BaseException | None = None
-    transient_failures = 0
+    api_failures = 0
+    transport_failures = 0
     cooldown_waits = 0
 
     while not stop_event.is_set():
@@ -469,9 +487,7 @@ def fetch_with_rotation(
                 raise
             cooldown_waits += 1
             delay = backoff_delay(cooldown_waits - 1, settings, exc.retry_after)
-            logger.warning(
-                "All enabled API keys cooling down; retrying in %.2fs", delay
-            )
+            logger.warning("All enabled API keys cooling down; retrying in %.2fs", delay)
             if interruptible_wait(delay):
                 raise InterruptedError("Shutdown requested")
             continue
@@ -496,20 +512,30 @@ def fetch_with_rotation(
             )
             key_pool.cooldown(key, cooldown)
             logger.warning("API key rate-limited; cooling it for %.2fs", cooldown)
-            # Try another ready key immediately. This does not consume api_retries.
             continue
-        except (requests.RequestException, InvalidPayloadError, EtherscanError) as exc:
+        except (requests.RequestException, TransientHttpError) as exc:
             last_error = exc
-            if transient_failures >= settings.api_retries:
+            client.metrics.transport_errors += isinstance(exc, requests.RequestException)
+            if transport_failures >= settings.transport_retries:
                 raise
-            delay = backoff_delay(transient_failures, settings, None)
-            transient_failures += 1
+            retry_after = exc.retry_after if isinstance(exc, TransientHttpError) else None
+            delay = backoff_delay(transport_failures, settings, retry_after)
+            transport_failures += 1
             logger.warning(
-                "Request failed (%s); retry %d/%d in %.2fs",
-                exc,
-                transient_failures,
-                settings.api_retries,
-                delay,
+                "Transport/server failure (%s); retry %d/%d in %.2fs",
+                exc, transport_failures, settings.transport_retries, delay,
+            )
+            if interruptible_wait(delay):
+                raise InterruptedError("Shutdown requested")
+        except (InvalidPayloadError, EtherscanError) as exc:
+            last_error = exc
+            if api_failures >= settings.api_retries:
+                raise
+            delay = backoff_delay(api_failures, settings, None)
+            api_failures += 1
+            logger.warning(
+                "API response failure (%s); retry %d/%d in %.2fs",
+                exc, api_failures, settings.api_retries, delay,
             )
             if interruptible_wait(delay):
                 raise InterruptedError("Shutdown requested")
@@ -699,6 +725,23 @@ def http_url(value: str) -> str:
     return value
 
 
+def proxy_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https", "socks4", "socks5", "socks5h"} or not parsed.netloc:
+        raise argparse.ArgumentTypeError("must be an absolute HTTP(S) or SOCKS proxy URL")
+    return value
+
+
+def nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a finite number zero or greater")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Monitor Etherscan gas-price recommendations")
     parser.add_argument("--api-key", action="append", default=[], help="repeat for multiple keys")
@@ -711,7 +754,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-retries", type=nonnegative_int, default=DEFAULT_API_RETRIES)
     parser.add_argument("--transport-retries", type=nonnegative_int, default=DEFAULT_TRANSPORT_RETRIES)
     parser.add_argument("--key-cooldown", type=positive_float, default=DEFAULT_KEY_COOLDOWN)
-    parser.add_argument("--proxy", default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"))
+    parser.add_argument("--proxy", type=proxy_url, default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"))
+    parser.add_argument("--backoff-base", type=positive_float, default=DEFAULT_BACKOFF_BASE)
+    parser.add_argument("--max-backoff", type=positive_float, default=DEFAULT_MAX_BACKOFF)
+    parser.add_argument("--max-jitter", type=nonnegative_float, default=DEFAULT_JITTER)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--output", type=Path, help="append output to this file")
     parser.add_argument("--no-flush", action="store_true", help="do not flush after every sample")
@@ -758,6 +804,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         key_cooldown=args.key_cooldown,
         api_retries=args.api_retries,
         transport_retries=args.transport_retries,
+        backoff_base=args.backoff_base,
+        max_backoff=args.max_backoff,
+        max_jitter=args.max_jitter,
     )
     metrics = Metrics()
     session = create_session(settings, args.proxy)
@@ -799,11 +848,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             owned_stream.close()
         logger.info(
             "Metrics | attempts=%d | success=%d | failures=%d | rate_limits=%d "
-            "| avg_latency=%.2fms | uptime=%.1fs",
+            "| transport_errors=%d | transient_http=%d | invalid_payloads=%d "
+            "| invalid_keys=%d | avg_latency=%.2fms | uptime=%.1fs",
             metrics.attempts,
             metrics.successes,
             metrics.failures,
             metrics.rate_limits,
+            metrics.transport_errors,
+            metrics.transient_http_errors,
+            metrics.invalid_payloads,
+            metrics.invalid_keys,
             metrics.avg_latency_ms,
             metrics.uptime_seconds,
         )
