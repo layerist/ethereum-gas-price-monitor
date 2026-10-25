@@ -48,14 +48,14 @@ from enum import Enum
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Final, Mapping, Sequence, TextIO
-from urllib.parse import urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 APP_NAME: Final = "eth-gas-monitor"
-APP_VERSION: Final = "9.0"
+APP_VERSION: Final = "9.1"
 DEFAULT_API_URL: Final = "https://api.etherscan.io/v2/api"
 DEFAULT_CHAIN_ID: Final = "1"
 DEFAULT_TIMEOUT: Final = (5.0, 10.0)
@@ -164,6 +164,10 @@ class PermanentApiKeyError(EtherscanError):
     pass
 
 
+class NonRetryableHttpError(EtherscanError):
+    """An HTTP status that should not consume retry budgets."""
+
+
 class TransientHttpError(EtherscanError):
     def __init__(self, message: str, retry_after: float | None = None):
         super().__init__(message)
@@ -186,7 +190,9 @@ class JsonFormatter(logging.Formatter):
 
 
 def setup_logging(level: str, structured: bool) -> None:
-    logger.handlers.clear()
+    for old_handler in logger.handlers[:]:
+        logger.removeHandler(old_handler)
+        old_handler.close()
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(
         JsonFormatter()
@@ -351,7 +357,8 @@ class ApiKeyPool:
         duration = self._default_cooldown if seconds is None else max(0.0, seconds)
         with self._lock:
             if key not in self._disabled:
-                self._cooldowns[key] = time.monotonic() + duration
+                deadline = time.monotonic() + duration
+                self._cooldowns[key] = max(self._cooldowns.get(key, 0.0), deadline)
 
     def disable(self, key: str) -> None:
         with self._lock:
@@ -381,6 +388,15 @@ class ApiKeyPool:
         return len(self._keys)
 
 
+def _safe_request_error(exc: requests.RequestException, api_key: str) -> requests.RequestException:
+    """Remove the API key from HTTP client errors that can contain request URLs."""
+    message = str(exc)
+    for secret in {api_key, quote(api_key, safe=""), quote_plus(api_key)}:
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    return requests.RequestException(f"{type(exc).__name__}: {message}")
+
+
 class EtherscanClient:
     def __init__(self, session: requests.Session, settings: Settings, metrics: Metrics):
         self.session = session
@@ -398,7 +414,11 @@ class EtherscanClient:
         self.metrics.attempts += 1
         try:
             response = self.session.get(
-                self.settings.api_url, params=params, timeout=self.settings.timeout
+                self.settings.api_url,
+                params=params,
+                timeout=self.settings.timeout,
+                proxies=self.session.proxies or None,  # Explicit proxy wins over environment.
+                allow_redirects=False,  # Do not forward API keys to redirect targets.
             )
             logger.debug("HTTP %s", response.status_code)
 
@@ -415,7 +435,10 @@ class EtherscanClient:
                     f"HTTP {response.status_code} {response.reason}", retry_after
                 )
 
-            response.raise_for_status()
+            if not 200 <= response.status_code < 300:
+                # HTTPError includes the full request URL (including apikey).
+                raise NonRetryableHttpError(f"HTTP {response.status_code} {response.reason}")
+
             try:
                 payload = response.json()
             except requests.exceptions.JSONDecodeError as exc:
@@ -439,6 +462,10 @@ class EtherscanClient:
 
             self.metrics.successes += 1
             return prices
+        except requests.RequestException as exc:
+            # Requests exceptions can expose the key via the query string.
+            self.metrics.failures += 1
+            raise _safe_request_error(exc, api_key) from None
         except Exception:
             self.metrics.failures += 1
             raise
@@ -456,7 +483,10 @@ def backoff_delay(attempt: int, settings: Settings, retry_after: float | None) -
     if retry_after is not None:
         # Retry-After is a server instruction. Do not cap it below the requested wait.
         return max(0.0, retry_after) + jitter
-    base = settings.backoff_base**attempt
+    try:
+        base = settings.backoff_base**attempt
+    except OverflowError:
+        base = math.inf
     return min(settings.max_backoff, base + jitter)
 
 
@@ -527,7 +557,9 @@ def fetch_with_rotation(
             )
             if interruptible_wait(delay):
                 raise InterruptedError("Shutdown requested")
-        except (InvalidPayloadError, EtherscanError) as exc:
+        except NonRetryableHttpError:
+            raise
+        except EtherscanError as exc:
             last_error = exc
             if api_failures >= settings.api_retries:
                 raise
@@ -552,10 +584,12 @@ class OutputWriter:
         stream: TextIO,
         include_header: bool,
         flush: bool,
+        prepend_newline: bool = False,
     ) -> None:
         self.mode = mode
         self.stream = stream
         self.flush = flush
+        self._prepend_newline = prepend_newline
         self._csv = csv.writer(stream, lineterminator="\n") if mode == "csv" else None
         self._header_written = False
         self._console: Any | None = None
@@ -570,6 +604,10 @@ class OutputWriter:
         self._header_written = True
 
     def write(self, prices: GasPrices, chain_id: str) -> None:
+        if self._prepend_newline:
+            # An existing output file may end with an unterminated record.
+            self.stream.write("\n")
+            self._prepend_newline = False
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         if self.mode in {"json", "jsonl"}:
             payload = {"timestamp": timestamp, "chain_id": chain_id, **prices.as_dict()}
@@ -652,6 +690,9 @@ def run_monitor(
             prices = fetch_with_rotation(client, key_pool, settings)
         except InterruptedError:
             break
+        except NoUsableApiKeys:
+            # Invalid or revoked keys will never recover during this run.
+            raise
         except requests.RequestException as exc:
             logger.error("Network error: %s", exc)
         except EtherscanError as exc:
@@ -718,18 +759,33 @@ def positive_int_text(value: str) -> str:
     return str(parsed)
 
 
-def http_url(value: str) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise argparse.ArgumentTypeError("must be an absolute http(s) URL")
+def _validated_url(value: str, schemes: set[str], description: str) -> str:
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        port = parsed.port  # Access validates the port number.
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid {description}: {exc}") from exc
+    if (
+        parsed.scheme not in schemes
+        or not hostname
+        or any(char.isspace() for char in value)
+        or parsed.fragment
+        or (port is not None and port == 0)
+    ):
+        raise argparse.ArgumentTypeError(f"must be an absolute {description} without a fragment")
     return value
+
+
+def http_url(value: str) -> str:
+    return _validated_url(value, {"http", "https"}, "http(s) URL")
 
 
 def proxy_url(value: str) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https", "socks4", "socks5", "socks5h"} or not parsed.netloc:
-        raise argparse.ArgumentTypeError("must be an absolute HTTP(S) or SOCKS proxy URL")
-    return value
+    return _validated_url(
+        value, {"http", "https", "socks4", "socks5", "socks5h"},
+        "HTTP(S) or SOCKS proxy URL",
+    )
 
 
 def nonnegative_float(value: str) -> float:
@@ -754,7 +810,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-retries", type=nonnegative_int, default=DEFAULT_API_RETRIES)
     parser.add_argument("--transport-retries", type=nonnegative_int, default=DEFAULT_TRANSPORT_RETRIES)
     parser.add_argument("--key-cooldown", type=positive_float, default=DEFAULT_KEY_COOLDOWN)
-    parser.add_argument("--proxy", type=proxy_url, default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"))
+    parser.add_argument(
+        "--proxy", type=proxy_url,
+        help="override proxy settings (otherwise use standard proxy environment variables)",
+    )
     parser.add_argument("--backoff-base", type=positive_float, default=DEFAULT_BACKOFF_BASE)
     parser.add_argument("--max-backoff", type=positive_float, default=DEFAULT_MAX_BACKOFF)
     parser.add_argument("--max-jitter", type=nonnegative_float, default=DEFAULT_JITTER)
@@ -786,11 +845,23 @@ def install_signal_handlers() -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     stop_event.clear()
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # argparse does not apply type converters to string defaults supplied by
+    # environment variables. Validate those defaults before making requests.
+    try:
+        args.chain_id = positive_int_text(str(args.chain_id))
+        args.api_url = http_url(args.api_url)
+        if args.proxy is not None:
+            args.proxy = proxy_url(args.proxy)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
     setup_logging(args.log_level, args.structured_logs)
     install_signal_handlers()
 
-    keys = list(dict.fromkeys([*args.api_key, *env_api_keys()]))
+    keys = list(dict.fromkeys(
+        key.strip() for key in [*args.api_key, *env_api_keys()] if key.strip()
+    ))
     if not keys:
         logger.error("Missing API key: use --api-key or ETHERSCAN_API_KEY(S)")
         return 2
@@ -815,9 +886,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         output_was_empty = True
+        prepend_newline = False
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             output_was_empty = not args.output.exists() or args.output.stat().st_size == 0
+            if not output_was_empty:
+                with args.output.open("rb") as existing_file:
+                    existing_file.seek(-1, os.SEEK_END)
+                    prepend_newline = existing_file.read(1) not in (b"\r", b"\n")
             owned_stream = args.output.open("a", encoding="utf-8", newline="")
             stream = owned_stream
 
@@ -827,6 +903,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stream=stream,
             include_header=not args.no_csv_header and output_was_empty,
             flush=not args.no_flush,
+            prepend_newline=prepend_newline,
         )
         client = EtherscanClient(session, settings, metrics)
         key_pool = ApiKeyPool(keys, settings.key_cooldown)
@@ -836,6 +913,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.once and not had_success:
             return 1
         return 0
+    except NoUsableApiKeys as exc:
+        logger.error("Cannot continue: %s", exc)
+        return 1
     except (OSError, UnicodeError) as exc:
         logger.error("Output error: %s", exc)
         return 1
