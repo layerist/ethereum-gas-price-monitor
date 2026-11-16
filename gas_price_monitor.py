@@ -55,7 +55,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 APP_NAME: Final = "eth-gas-monitor"
-APP_VERSION: Final = "9.1"
+APP_VERSION: Final = "9.2"
 DEFAULT_API_URL: Final = "https://api.etherscan.io/v2/api"
 DEFAULT_CHAIN_ID: Final = "1"
 DEFAULT_TIMEOUT: Final = (5.0, 10.0)
@@ -255,7 +255,10 @@ def _joined_lower(*values: Any) -> str:
 
 def _looks_rate_limited(*values: Any) -> bool:
     text = _joined_lower(*values)
-    markers = ("rate limit", "max rate", "too many request", "throttl")
+    markers = (
+        "rate limit", "max rate", "max calls", "too many request",
+        "throttl", "daily limit", "limit reached",
+    )
     return any(marker in text for marker in markers)
 
 
@@ -266,6 +269,9 @@ def _looks_invalid_api_key(*values: Any) -> bool:
         "missing/invalid api key",
         "api key not activated",
         "invalidapikey",
+        "api key is invalid",
+        "api key expired",
+        "invalid key",
     )
     return any(marker in text for marker in markers)
 
@@ -388,13 +394,31 @@ class ApiKeyPool:
         return len(self._keys)
 
 
+def _redact_api_key(message: str, api_key: str) -> str:
+    """Mask both literal and URL-encoded API keys in untrusted error messages."""
+    variants = {api_key, quote(api_key, safe=""), quote_plus(api_key)}
+    for secret in sorted(filter(None, variants), key=len, reverse=True):
+        message = message.replace(secret, "[REDACTED]")
+    return message
+
+
 def _safe_request_error(exc: requests.RequestException, api_key: str) -> requests.RequestException:
-    """Remove the API key from HTTP client errors that can contain request URLs."""
-    message = str(exc)
-    for secret in {api_key, quote(api_key, safe=""), quote_plus(api_key)}:
-        if secret:
-            message = message.replace(secret, "[REDACTED]")
-    return requests.RequestException(f"{type(exc).__name__}: {message}")
+    """Remove API credentials from request exceptions, which may include full URLs."""
+    return requests.RequestException(
+        f"{type(exc).__name__}: {_redact_api_key(str(exc), api_key)}"
+    )
+
+
+def _safe_api_error(exc: EtherscanError, api_key: str) -> EtherscanError:
+    """Retain the error classification without logging echoed API credentials."""
+    message = _redact_api_key(str(exc), api_key)
+    if message == str(exc):
+        return exc
+    if isinstance(exc, RateLimitError):
+        return type(exc)(message, exc.retry_after)
+    if isinstance(exc, TransientHttpError):
+        return TransientHttpError(message, exc.retry_after)
+    return type(exc)(message)
 
 
 class EtherscanClient:
@@ -413,59 +437,66 @@ class EtherscanClient:
         started = time.perf_counter()
         self.metrics.attempts += 1
         try:
-            response = self.session.get(
+            # Never follow redirects, which could disclose the API key to another host.
+            with self.session.get(
                 self.settings.api_url,
                 params=params,
                 timeout=self.settings.timeout,
-                proxies=self.session.proxies or None,  # Explicit proxy wins over environment.
-                allow_redirects=False,  # Do not forward API keys to redirect targets.
-            )
-            logger.debug("HTTP %s", response.status_code)
+                proxies=self.session.proxies or None,
+                allow_redirects=False,
+            ) as response:
+                logger.debug("HTTP %s", response.status_code)
+                retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                if response.status_code == 429:
+                    self.metrics.rate_limits += 1
+                    raise RateLimitError("HTTP 429 Too Many Requests", retry_after)
+                if response.status_code == 401:
+                    self.metrics.invalid_keys += 1
+                    raise PermanentApiKeyError("HTTP 401 Unauthorized")
+                if response.status_code in {408, 425, 500, 502, 503, 504}:
+                    self.metrics.transient_http_errors += 1
+                    raise TransientHttpError(
+                        f"HTTP {response.status_code} {response.reason}", retry_after
+                    )
+                if not 200 <= response.status_code < 300:
+                    # HTTPError can include the full request URL, including apikey.
+                    raise NonRetryableHttpError(
+                        f"HTTP {response.status_code} {response.reason}"
+                    )
 
-            retry_after = parse_retry_after(response.headers.get("Retry-After"))
-            if response.status_code == 429:
-                self.metrics.rate_limits += 1
-                raise RateLimitError("HTTP 429 Too Many Requests", retry_after)
-            if response.status_code == 401:
-                self.metrics.invalid_keys += 1
-                raise PermanentApiKeyError("HTTP 401 Unauthorized")
-            if response.status_code in {408, 425, 500, 502, 503, 504}:
-                self.metrics.transient_http_errors += 1
-                raise TransientHttpError(
-                    f"HTTP {response.status_code} {response.reason}", retry_after
-                )
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    self.metrics.invalid_payloads += 1
+                    preview = response.text[:200].replace("\r", " ").replace("\n", " ")
+                    raise InvalidPayloadError(f"Non-JSON response: {preview!r}") from exc
 
-            if not 200 <= response.status_code < 300:
-                # HTTPError includes the full request URL (including apikey).
-                raise NonRetryableHttpError(f"HTTP {response.status_code} {response.reason}")
+                try:
+                    prices = parse_payload(payload)
+                except RateLimitError as exc:
+                    self.metrics.rate_limits += 1
+                    if exc.retry_after is None:
+                        exc.retry_after = retry_after
+                    raise
+                except PermanentApiKeyError:
+                    self.metrics.invalid_keys += 1
+                    raise
+                except InvalidPayloadError:
+                    self.metrics.invalid_payloads += 1
+                    raise
 
-            try:
-                payload = response.json()
-            except requests.exceptions.JSONDecodeError as exc:
-                self.metrics.invalid_payloads += 1
-                preview = response.text[:200].replace("\r", " ").replace("\n", " ")
-                raise InvalidPayloadError(f"Non-JSON response: {preview!r}") from exc
-
-            try:
-                prices = parse_payload(payload)
-            except RateLimitError as exc:
-                self.metrics.rate_limits += 1
-                if exc.retry_after is None:
-                    exc.retry_after = retry_after
-                raise
-            except PermanentApiKeyError:
-                self.metrics.invalid_keys += 1
-                raise
-            except InvalidPayloadError:
-                self.metrics.invalid_payloads += 1
-                raise
-
-            self.metrics.successes += 1
-            return prices
+                self.metrics.successes += 1
+                return prices
         except requests.RequestException as exc:
-            # Requests exceptions can expose the key via the query string.
+            self.metrics.transport_errors += 1
             self.metrics.failures += 1
             raise _safe_request_error(exc, api_key) from None
+        except EtherscanError as exc:
+            self.metrics.failures += 1
+            safe_exc = _safe_api_error(exc, api_key)
+            if safe_exc is exc:
+                raise
+            raise safe_exc from None
         except Exception:
             self.metrics.failures += 1
             raise
@@ -545,7 +576,6 @@ def fetch_with_rotation(
             continue
         except (requests.RequestException, TransientHttpError) as exc:
             last_error = exc
-            client.metrics.transport_errors += isinstance(exc, requests.RequestException)
             if transport_failures >= settings.transport_retries:
                 raise
             retry_after = exc.retry_after if isinstance(exc, TransientHttpError) else None
@@ -743,7 +773,10 @@ def positive_float(value: str) -> float:
 
 
 def nonnegative_int(value: str) -> int:
-    parsed = int(value)
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from exc
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be zero or greater")
     return parsed
